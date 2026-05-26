@@ -42,6 +42,14 @@ class OutboundPipeline:
         self._render_style = render_style
         self._state_path = Path(state_path) if state_path else None
         self._current_turn: Turn | None = None
+        # Image upload caching:
+        # - successful path → image_key (avoid re-uploading the same file
+        #   when Claude/Codex references it across multiple turns).
+        # - failed paths are remembered so we don't keep retrying a file the
+        #   daemon can't read (e.g. ~/Desktop blocked by macOS TCC sandbox,
+        #   or a path the model fabricated that doesn't actually exist).
+        self._image_key_cache: dict[str, str] = {}
+        self._failed_image_paths: set[str] = set()
 
     async def process_backlog(self) -> None:
         """Read new bytes from jsonl past current offset; render any new turns.
@@ -111,23 +119,37 @@ class OutboundPipeline:
         await self._send_or_update_with_card(card)
 
     async def _upload_turn_images(self, turn: Turn) -> dict[str, str]:
-        """Upload all local image files referenced in `turn`. Returns path → image_key."""
+        """Upload all local image files referenced in `turn`. Returns path → image_key.
+
+        Uses two-tier caching so we never re-upload the same file twice,
+        and never re-try a path the daemon proved it can't read (file is
+        missing, or macOS TCC blocks daemon's read of ~/Desktop, etc.).
+        Without this, a turn that fabricates the same fake path 20 times
+        would have spent 20 rate-limit tokens per flush — starving text
+        cards behind a queue of doomed uploads.
+        """
         import os
         paths = collect_image_paths(turn)
         if not paths:
             return {}
         result: dict[str, str] = {}
         for path in paths:
-            if not os.path.exists(path):
+            if path in self._image_key_cache:
+                result[path] = self._image_key_cache[path]
                 continue
-            # Rate-limited: each upload counts against the same bucket so we
-            # don't blow Feishu's app-bot quota with a burst.
+            if path in self._failed_image_paths:
+                continue
+            if not os.path.exists(path):
+                self._failed_image_paths.add(path)
+                continue
             await self._bucket.acquire()
             try:
                 key = await self._lark.upload_image(path)
+                self._image_key_cache[path] = key
                 result[path] = key
             except Exception as e:
-                logger.warning("upload_image failed for %s: %s", path, e)
+                logger.warning("upload_image failed for %s: %s (caching as failed)", path, e)
+                self._failed_image_paths.add(path)
         return result
 
     async def _send_or_update_with_card(self, card: dict) -> None:
