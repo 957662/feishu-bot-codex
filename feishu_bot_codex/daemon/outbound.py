@@ -12,6 +12,7 @@ from feishu_bot_codex.daemon.state import BindingRuntimeState
 from feishu_bot_codex.rendering.turn import (
     JsonlEvent,
     Turn,
+    collect_image_paths,
     render_turn_to_card,
 )
 
@@ -75,12 +76,6 @@ class OutboundPipeline:
         await self._flush_current_turn()
 
     async def _handle_event(self, event: JsonlEvent) -> None:
-        # Codex jsonl envelopes (session_meta / turn_context / event_msg) and
-        # things like developer messages / reasoning are normalized to role
-        # "_meta" by JsonlEvent.from_dict — skip them entirely.
-        if event.is_meta():
-            return
-
         if event.role == "user" and not event.has_only_tool_results():
             # User event closes the previous turn → flush it.
             await self._flush_current_turn()
@@ -100,35 +95,51 @@ class OutboundPipeline:
         chat_id = self._effective_chat_id()
         if not chat_id:
             return
+
+        # Upload any images referenced in this turn so the card can embed them.
+        # Failures are tolerated — the path stays in the markdown as text.
+        image_keys = await self._upload_turn_images(self._current_turn)
+
         card = render_turn_to_card(
             self._current_turn,
             project_name=self._project_name,
             render_style=self._render_style,
+            image_keys=image_keys,
         )
-        # Skip turns with no meaningful body content (e.g. system meta turns)
         if not card.get("body", {}).get("elements"):
             return
         await self._send_or_update_with_card(card)
+
+    async def _upload_turn_images(self, turn: Turn) -> dict[str, str]:
+        """Upload all local image files referenced in `turn`. Returns path → image_key."""
+        import os
+        paths = collect_image_paths(turn)
+        if not paths:
+            return {}
+        result: dict[str, str] = {}
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            # Rate-limited: each upload counts against the same bucket so we
+            # don't blow Feishu's app-bot quota with a burst.
+            await self._bucket.acquire()
+            try:
+                key = await self._lark.upload_image(path)
+                result[path] = key
+            except Exception as e:
+                logger.warning("upload_image failed for %s: %s", path, e)
+        return result
 
     async def _send_or_update_with_card(self, card: dict) -> None:
         await self._bucket.acquire()
         try:
             if self._state.current_turn_card_id is None:
-                # Idempotency key: max 50 chars + [A-Za-z0-9_-] only (Feishu uuid limit).
-                # Hash a per-turn-unique seed: prefer Claude's uuid, fall back
-                # to Codex's per-event timestamp (top-level ISO string) +
-                # text fingerprint so each turn produces a distinct key.
+                # Idempotency key: max 32 chars + hex only (Feishu constraint).
+                # Use last 16 hex chars of user_uuid (or random fallback).
                 import hashlib
-                ue = self._current_turn.user_event if self._current_turn else None
-                if ue and ue.uuid:
-                    seed = ue.uuid
-                elif ue:
-                    ts = ue.raw.get("timestamp", "")
-                    seed = f"{ts}|{ue.text()[:80]}"
-                else:
-                    seed = f"orphan|{self._state.binding_name}|{self._state.jsonl_offset}"
-                short_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
-                key = f"fbc{short_id}"  # ~19 chars, safe under Feishu's 50-char uuid limit
+                user_uuid = self._current_turn.user_event.uuid if self._current_turn and self._current_turn.user_event else ""
+                short_id = hashlib.sha256(user_uuid.encode()).hexdigest()[:16] if user_uuid else "noUUID"
+                key = f"fbc{short_id}"  # ~19 chars, safe under any plausible limit
                 msg_id = await self._lark.send_card(
                     chat_id=self._effective_chat_id(),
                     card=card,

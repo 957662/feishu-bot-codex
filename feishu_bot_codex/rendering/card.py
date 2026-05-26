@@ -50,6 +50,18 @@ def build_divider() -> dict:
     return {"tag": "hr"}
 
 
+def build_image(image_key: str, alt: str = "") -> dict:
+    """Card element showing a previously-uploaded Feishu image.
+
+    `image_key` comes from a successful `lark-cli im images create` call.
+    """
+    return {
+        "tag": "img",
+        "img_key": image_key,
+        "alt": {"tag": "plain_text", "content": alt or " "},
+    }
+
+
 def build_note(content: str) -> dict:
     # Feishu schema 2.0 dropped the "note" tag. Render as small/grey markdown
     # to preserve the visual hint (token usage, truncation marker, etc.) without
