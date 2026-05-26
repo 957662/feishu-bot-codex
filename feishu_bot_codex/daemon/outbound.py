@@ -156,12 +156,23 @@ class OutboundPipeline:
         await self._bucket.acquire()
         try:
             if self._state.current_turn_card_id is None:
-                # Idempotency key: max 32 chars + hex only (Feishu constraint).
-                # Use last 16 hex chars of user_uuid (or random fallback).
+                # Idempotency key (≤50 chars, [A-Za-z0-9_-] only — Feishu uuid limit).
+                # MUST be unique per turn or Feishu's de-duplication will fold
+                # every turn into the same card_id. Claude jsonl events have
+                # a real `uuid`; Codex events DON'T (uuid="") so we fall back
+                # to a hash of the user event's timestamp + first 80 chars of
+                # its text.
                 import hashlib
-                user_uuid = self._current_turn.user_event.uuid if self._current_turn and self._current_turn.user_event else ""
-                short_id = hashlib.sha256(user_uuid.encode()).hexdigest()[:16] if user_uuid else "noUUID"
-                key = f"fbc{short_id}"  # ~19 chars, safe under any plausible limit
+                ue = self._current_turn.user_event if self._current_turn else None
+                if ue and ue.uuid:
+                    seed = ue.uuid
+                elif ue:
+                    ts = ue.raw.get("timestamp", "")
+                    seed = f"{ts}|{ue.text()[:80]}"
+                else:
+                    seed = f"orphan|{self._state.binding_name}|{self._state.jsonl_offset}"
+                short_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+                key = f"fbc{short_id}"  # ~19 chars, safe under Feishu's 50-char uuid limit
                 msg_id = await self._lark.send_card(
                     chat_id=self._effective_chat_id(),
                     card=card,
