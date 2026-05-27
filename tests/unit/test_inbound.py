@@ -47,8 +47,9 @@ async def test_inbound_routes_text_to_tmux():
     await pipeline.process_until_idle(max_events=1)
 
     send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    assert len(send_keys_calls) == 1
-    assert send_keys_calls[0][1]["keys"] == "hello claude\n"
+    # Codex split-send: body sent, then Enter sent separately.
+    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
+    assert keys_seq == "hello claude\n"
 
 
 @pytest.mark.asyncio
@@ -64,7 +65,8 @@ async def test_inbound_routes_slash_command_to_tmux():
     await pipeline.process_until_idle(max_events=1)
 
     send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    assert send_keys_calls[0][1]["keys"] == "/compact\n"
+    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
+    assert keys_seq == "/compact\n"
 
 
 @pytest.mark.asyncio
@@ -81,7 +83,10 @@ async def test_inbound_routes_menu_button_to_command():
     await pipeline.process_until_idle(max_events=1)
 
     send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    assert send_keys_calls[0][1]["keys"] == "/clear\n"
+    # Split-send: codex's completion popup eats an immediately-following
+    # Enter, so we send the command body and the Enter as two calls.
+    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
+    assert keys_seq == "/clear\n"
 
 
 @pytest.mark.asyncio
