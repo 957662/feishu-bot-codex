@@ -38,7 +38,8 @@ async def test_confirm_yes_sends_y_to_tmux():
     )
     await pipeline.process_until_idle(max_events=1)
     send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    assert send_keys_calls[-1][1]["keys"] == "y\n"
+    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
+    assert keys_seq == "y\n"
 
 
 @pytest.mark.asyncio
@@ -56,4 +57,5 @@ async def test_confirm_no_sends_n_to_tmux():
     )
     await pipeline.process_until_idle(max_events=1)
     send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    assert send_keys_calls[-1][1]["keys"] == "n\n"
+    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
+    assert keys_seq == "n\n"
