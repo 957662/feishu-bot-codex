@@ -169,7 +169,13 @@ class InboundPipeline:
         # open.feishu.cn/.../message-reaction/emojis-introduce
         if message_id:
             asyncio.create_task(self._react_quietly(message_id, "LOVE"))
-        self._tmux.send_keys(session=self._tmux_session, keys=text + "\n")
+        # Codex TUI swallows the immediate Enter after a paste because of its
+        # completion popup. Send body and Enter separately with a brief gap
+        # so codex's input box has time to settle. (Same workaround as
+        # _handle_image — applies to all text injections.)
+        self._tmux.send_keys(session=self._tmux_session, keys=text)
+        await asyncio.sleep(0.4)
+        self._tmux.send_keys(session=self._tmux_session, keys="\n")
 
     async def _handle_image(self, message_id: str, content_raw) -> None:
         """Standalone image message: download + inject absolute file path.
@@ -273,4 +279,8 @@ class InboundPipeline:
         if command is None:
             logger.info("unknown menu event_key: %s", event_key)
             return
-        self._tmux.send_keys(session=self._tmux_session, keys=command + "\n")
+        # Same split-send pattern as _handle_message — codex's completion
+        # popup sometimes swallows an immediately-following Enter.
+        self._tmux.send_keys(session=self._tmux_session, keys=command)
+        await asyncio.sleep(0.4)
+        self._tmux.send_keys(session=self._tmux_session, keys="\n")
