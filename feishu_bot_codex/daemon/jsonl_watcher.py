@@ -1,7 +1,7 @@
 """Async wrapper that yields a signal whenever the watched jsonl file grows.
 
 Uses watchfiles (fsevents/inotify) as the primary low-latency notifier, with
-a 2-second size-polling fallback. The polling fallback is critical for Codex,
+a 2-second size-polling fallback. The polling fallback is critical for Claude,
 which appends to jsonl in a way that doesn't reliably trigger fsevents on
 macOS — without it, the outbound mirror would stall indefinitely until
 something else touched the file.
@@ -18,9 +18,15 @@ import watchfiles
 
 logger = logging.getLogger(__name__)
 
-# How often to poll file size as a safety net. 2s is responsive enough for a
-# TUI mirror while being cheap on CPU.
-POLL_INTERVAL_SECONDS = 2.0
+# How often to poll file size as a safety net. 1 second gives a typewriter-like
+# refresh during active turn (one update_card per second well under Feishu's
+# 50/s rate limit).
+POLL_INTERVAL_SECONDS = 1.0
+
+# After this much idle time (no file growth), emit ONE more change so outbound
+# gets a final flush with in_progress=False — otherwise the "生成中…" spinner
+# stays on the card forever when the turn really has finished.
+SETTLE_AFTER_SECONDS = 6.0
 
 
 class JsonlWatcher:
@@ -59,17 +65,33 @@ class JsonlWatcher:
                 logger.exception("watchfiles task crashed; polling fallback continues")
 
         async def _poll_task():
+            import time
             last_size = -1
+            last_change_at = 0.0
+            settled_after_change = False  # have we already fired the "settle" tick?
             try:
                 while not stop_event.is_set():
                     try:
                         size = self._path.stat().st_size if self._path.exists() else 0
                     except OSError:
                         size = last_size
+                    now = time.time()
                     if size != last_size:
                         last_size = size
+                        last_change_at = now
+                        settled_after_change = False
                         if size > 0:
                             await queue.put(None)
+                    elif (
+                        not settled_after_change
+                        and last_size > 0
+                        and now - last_change_at > SETTLE_AFTER_SECONDS
+                    ):
+                        # File has been quiet long enough → fire one more tick
+                        # so outbound can repaint the card with in_progress=False
+                        # (removing the typewriter cursor / "生成中…" footer).
+                        settled_after_change = True
+                        await queue.put(None)
                     try:
                         await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL_SECONDS)
                     except asyncio.TimeoutError:

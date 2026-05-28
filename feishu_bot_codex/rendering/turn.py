@@ -510,9 +510,35 @@ def render_turn_to_card(
 
     if in_progress:
         import time
-        n = int(time.time()) % 4
-        dots = "·" * n + " " * (3 - n)
-        elements.append(build_note(f"⏳ 思考中…{dots}"))
+        tick = int(time.time() * 2) % 4
+        cursors = ["▌", "▍", "▎", "▏"]
+        cursor = cursors[tick]
+        anchored = False
+        for el in reversed(elements):
+            if el.get("tag") == "markdown" and isinstance(el.get("content"), str):
+                base = el["content"].rstrip("▌▍▎▏ \n")
+                el["content"] = base + " " + cursor
+                anchored = True
+                break
+        spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][int(time.time() * 8) % 10]
+        started = None
+        for e in turn.assistant_events:
+            ts = e.raw.get("timestamp")
+            if isinstance(ts, str) and ts:
+                started = ts; break
+        elapsed = ""
+        if started:
+            try:
+                import datetime
+                t0 = datetime.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+                secs = int(time.time() - t0)
+                if 0 <= secs < 7200:
+                    elapsed = f"  ·  ⏱ {secs}s"
+            except Exception:
+                pass
+        if not anchored:
+            elements.append(build_markdown(cursor))
+        elements.append(build_note(f"{spinner} 生成中{elapsed}"))
 
     header = build_header(title=f"🤖 Codex · {project_name}")
     return build_card(header=header, elements=elements)
