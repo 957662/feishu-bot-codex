@@ -260,14 +260,48 @@ class Orchestrator:
         return stale
 
     def _guess_jsonl_path(self, cfg: BindingConfig) -> Path:
-        """Find newest jsonl in ~/.claude/projects/<encoded-cwd>/ — mtime-based."""
+        """Find the newest session jsonl for cfg.project_dir across BOTH backends.
+
+        - Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, scan for one
+          whose session_meta.payload.cwd matches.
+        - Claude: ~/.claude/projects/-<encoded-cwd>/*.jsonl (cwd in dir name).
+
+        Picks the most-recently-modified across both. Returns a sentinel path
+        if neither side has a session yet; the polling watcher will detect
+        creation later.
+        """
+        import json
         home = Path.home()
+        candidates: list[Path] = []
+
+        sessions_root = home / ".codex" / "sessions"
+        if sessions_root.exists():
+            for path in sessions_root.glob("*/*/*/rollout-*.jsonl"):
+                try:
+                    with path.open("r", encoding="utf-8") as f:
+                        first = f.readline().strip()
+                    if not first:
+                        continue
+                    meta = json.loads(first)
+                    if meta.get("type") != "session_meta":
+                        continue
+                    if meta.get("payload", {}).get("cwd") == cfg.project_dir:
+                        candidates.append(path)
+                except Exception:
+                    continue
+
         encoded = cfg.project_dir.replace("/", "-").lstrip("-")
-        projects_dir = home / ".claude" / "projects" / f"-{encoded}"
-        if not projects_dir.exists():
-            return projects_dir / "no-session.jsonl"
-        candidates = sorted(projects_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates[0] if candidates else projects_dir / "no-session.jsonl"
+        claude_dir = home / ".claude" / "projects" / f"-{encoded}"
+        if claude_dir.exists():
+            candidates.extend(claude_dir.glob("*.jsonl"))
+
+        if not candidates:
+            if sessions_root.exists():
+                return sessions_root / "no-session.jsonl"
+            return claude_dir / "no-session.jsonl"
+
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0]
 
     async def _outbound_loop(self, running: RunningBinding, jsonl_path: Path, state_path: Path) -> None:
         """Watch jsonl, process new bytes on each change, persist state."""
