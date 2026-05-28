@@ -55,6 +55,7 @@
 git clone https://github.com/957662/feishu-bot-codex ~/project/feishu-bot-codex
 cd ~/project/feishu-bot-codex
 ./setup.sh
+# 可选: npm i -g @mermaid-js/mermaid-cli   # 把 ```mermaid 代码块自动渲染成图片插到飞书卡片里
 cd ~/your-project
 
 # 默认起 codex
