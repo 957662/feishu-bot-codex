@@ -106,7 +106,7 @@ class OutboundPipeline:
             if idle > SETTLE_AFTER_SECONDS:
                 await self._flush_current_turn(in_progress=False)
                 self._final_flushed_at_offset = self._state.jsonl_offset
-            elif now - self._last_anim_flushed_at > 0.09:
+            elif now - self._last_anim_flushed_at > 0.030:
                 await self._flush_current_turn(in_progress=True)
                 self._last_anim_flushed_at = now
             return

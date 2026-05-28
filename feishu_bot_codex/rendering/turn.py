@@ -510,7 +510,7 @@ def render_turn_to_card(
 
     if in_progress:
         import time
-        spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][int(time.time() * 10) % 10]
+        spinner = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"][int(time.time() * 20) % 8]
         started = None
         for e in turn.assistant_events:
             ts = e.raw.get("timestamp")

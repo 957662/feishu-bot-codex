@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # How often to poll file size as a safety net. 1 second gives a typewriter-like
 # refresh during active turn (one update_card per second well under Feishu's
 # 50/s rate limit).
-POLL_INTERVAL_SECONDS = 0.1
+POLL_INTERVAL_SECONDS = 0.033
 
 # After this much idle time (no file growth), emit ONE more change so outbound
 # gets a final flush with in_progress=False — otherwise the "生成中…" spinner
