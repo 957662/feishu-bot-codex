@@ -221,6 +221,7 @@ class RealLarkCli(LarkCli):
         binary: str = "lark-cli",
         as_bot: bool = True,
         extra_env: dict[str, str] | None = None,
+        profile: str | None = None,
         ws_app_id: str | None = None,
         ws_app_secret: str | None = None,
         ws_domain: str = "https://open.feishu.cn",
@@ -228,6 +229,10 @@ class RealLarkCli(LarkCli):
         self._binary = binary
         self._as_bot = as_bot
         self._extra_env = dict(extra_env or {})
+        # --profile <name>: critical when multiple lark-cli profiles exist
+        # (e.g. claude bot + codex bot on the same Mac). Without it, lark-cli
+        # uses its default profile and silently talks to the WRONG app.
+        self._profile = profile
         # If WS credentials are provided, consume_events() uses lark-oapi over
         # WebSocket (covering message + menu + card.action events). Without
         # them, falls back to the lark-cli subprocess path (message only).
@@ -264,7 +269,13 @@ class RealLarkCli(LarkCli):
         return combined, proc.returncode
 
     def _common_args(self) -> list[str]:
-        return ["--as", "bot"] if self._as_bot else []
+        """Args injected into every lark-cli invocation."""
+        args: list[str] = []
+        if self._profile:
+            args += ["--profile", self._profile]
+        if self._as_bot:
+            args += ["--as", "bot"]
+        return args
 
     def _extract_message_id(self, out: str) -> str:
         """lark-cli emits a (possibly pretty-printed) JSON object on stdout.

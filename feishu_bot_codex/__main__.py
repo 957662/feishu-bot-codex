@@ -42,14 +42,20 @@ async def _run_daemon() -> None:
     keychain = MacOSKeychainStore()
 
     def _lark_for_binding(cfg) -> RealLarkCli:
-        """Build a RealLarkCli that owns its WS event source per binding.
+        """Build a RealLarkCli scoped to one binding.
 
-        The WS client subscribes to message + menu + card.action events for
-        this specific app, replacing the lark-cli `event consume` subprocess
-        which is dead code for menu/card events.
+        - profile=cfg.name: critical when multiple lark-cli profiles exist
+          on the same machine (codex side typically has both bot-codex and
+          a Claude bot). Without --profile the fallback `event consume` /
+          `send_card` calls hit the WRONG app's event stream.
+        - ws_app_id / ws_app_secret: if a secret was persisted at bind time,
+          we use lark-oapi WebSocket (covers menu_v6 + card.action.trigger,
+          which lark-cli's `event consume` doesn't register). Otherwise the
+          fallback lark-cli subprocess path still works (text msgs only).
         """
         secret = keychain.get(cfg.secret_ref) if cfg.secret_ref else None
         return RealLarkCli(
+            profile=cfg.name,
             ws_app_id=cfg.feishu_app_id,
             ws_app_secret=secret,
             ws_domain=cfg.domain or "https://open.feishu.cn",
