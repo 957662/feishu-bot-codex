@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 # setup.sh — install/upgrade/uninstall/doctor for feishu-bot-codex.
+# 全自动:检测缺失依赖 → 经你同意后用 brew / apt / npm 装好 → 注册 daemon
+#   ./setup.sh              交互式询问每个依赖
+#   ./setup.sh install -y   非交互式,直接装所有缺的
+#   ./setup.sh doctor       只检测,不装
+#   ./setup.sh uninstall    卸 daemon + 全局软链,保留 bindings
+#   ./setup.sh update       拉代码 + 重装依赖
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 ACTION="${1:-install}"
+AUTO_YES="${YES:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) AUTO_YES=1 ;;
+    esac
+done
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helpers — detection / consent / auto-install
 # -----------------------------------------------------------------------------
 
 detect_os() {
@@ -19,29 +31,102 @@ detect_os() {
     esac
 }
 
-need_cmd() {
-    local missing=()
-    for cmd in "$@"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing+=("$cmd")
-        fi
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo "ERROR: missing required commands: ${missing[*]}" >&2
-        echo "On macOS:   brew install ${missing[*]}" >&2
-        echo "On Linux:   apt install ${missing[*]}    (or your distro's equivalent)" >&2
+confirm() {
+    local msg="$1"
+    if [ "$AUTO_YES" = "1" ]; then
+        echo "[auto-yes] $msg"
+        return 0
+    fi
+    # /dev/tty so we still read input even when stdout is piped
+    read -rp "$msg [Y/n] " ans </dev/tty || ans="y"
+    case "${ans:-y}" in
+        n|N|no|No|NO) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Re-source brew shellenv so newly-installed binaries land on PATH for the
+# rest of this script (otherwise we'd need to tell the user to restart shell)
+refresh_path() {
+    if [ -x /opt/homebrew/bin/brew ]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [ -x /usr/local/bin/brew ]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    # npm global bin (in case node was just installed)
+    if command -v npm >/dev/null 2>&1; then
+        local npm_prefix
+        npm_prefix="$(npm prefix -g 2>/dev/null || echo)"
+        [ -n "$npm_prefix" ] && export PATH="$npm_prefix/bin:$PATH"
+    fi
+}
+
+ensure_brew() {
+    if command -v brew >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! confirm "Homebrew 没装。它是 macOS 上自动装 python/tmux/node 的入口,装吗?"; then
+        echo "ERROR: 没 brew 就没法自动装其他依赖。手动装好 python3/tmux/node 后重新跑。" >&2
+        return 1
+    fi
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    refresh_path
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "ERROR: brew 装完仍然找不到。可能需要手动 source ~/.zshrc 后重跑。" >&2
         return 1
     fi
 }
 
-ensure_lark_cli() {
-    if command -v lark-cli >/dev/null 2>&1; then
-        echo "[ok] lark-cli already installed: $(lark-cli --version 2>/dev/null | head -1 || echo present)"
-    else
-        echo "[install] lark-cli via npm..."
-        npm install -g @larksuite/cli
+# ensure_pkg <command-to-check> [brew-pkg-name] [apt-pkg-name]
+ensure_pkg() {
+    local cmd="$1"
+    local brew_pkg="${2:-$1}"
+    local apt_pkg="${3:-$1}"
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo "[ok] $cmd: $(command -v "$cmd")"
+        return 0
+    fi
+    local os; os="$(detect_os)"
+    case "$os" in
+        macos)
+            ensure_brew || return 1
+            if confirm "缺 $cmd,用 brew install $brew_pkg 自动装吗?"; then
+                brew install "$brew_pkg"
+                refresh_path
+            else
+                echo "ERROR: 没 $cmd 没法继续。" >&2; return 1
+            fi
+            ;;
+        linux)
+            if confirm "缺 $cmd,用 sudo apt-get install -y $apt_pkg 装吗?"; then
+                sudo apt-get update -qq
+                sudo apt-get install -y "$apt_pkg"
+            else
+                echo "ERROR: 没 $cmd 没法继续。" >&2; return 1
+            fi
+            ;;
+        *)
+            echo "ERROR: 不识别的系统,手动装 $cmd 后重跑。" >&2; return 1
+            ;;
+    esac
+}
+
+ensure_npm_global() {
+    local pkg="$1"
+    local bin="$2"
+    if command -v "$bin" >/dev/null 2>&1; then
+        echo "[ok] $bin: $(command -v "$bin")"
+        return 0
+    fi
+    if confirm "缺 $bin,用 npm i -g $pkg 装吗?"; then
+        npm install -g "$pkg"
+        refresh_path
     fi
 }
+
+# -----------------------------------------------------------------------------
+# Install pieces (unchanged from before; just called from action_install)
+# -----------------------------------------------------------------------------
 
 install_python_pkg() {
     if [ ! -d .venv ]; then
@@ -55,15 +140,10 @@ install_python_pkg() {
     pip install --quiet -e ".[dev]"
 }
 
-# Pick a global bin directory that's on most users' PATH.
-# Apple Silicon Homebrew → /opt/homebrew/bin
-# Intel Homebrew / Linux → /usr/local/bin
-# Last resort → ~/.local/bin (usually on PATH from .zshrc/.bashrc)
 global_bin_dir() {
     for d in /opt/homebrew/bin /usr/local/bin; do
         if [ -d "$d" ] && [ -w "$d" ]; then
-            echo "$d"
-            return 0
+            echo "$d"; return 0
         fi
     done
     mkdir -p "$HOME/.local/bin"
@@ -81,7 +161,7 @@ install_global_symlink() {
     ln -sf "$target" "$link"
     echo "[ok] symlink: $link → $target"
     if ! command -v feishu-bot-codex >/dev/null 2>&1; then
-        echo "WARN: $link is not on your PATH. Add $bin_dir to PATH in your shell rc." >&2
+        echo "WARN: $link 不在 PATH 上,把 $bin_dir 加到你 shell rc 里。" >&2
     fi
 }
 
@@ -118,7 +198,7 @@ install_service() {
     case "$os" in
         macos) install_launchd ;;
         linux) install_systemd ;;
-        *)     echo "WARN: unsupported OS $os; daemon must be started manually." ;;
+        *)     echo "WARN: 不识别的系统 $os; daemon 需手动启动。" ;;
     esac
 }
 
@@ -132,7 +212,7 @@ wait_for_socket() {
         fi
         sleep 0.5
     done
-    echo "WARN: socket did not appear within 10s. Check logs in $HOME/.feishu-bot-codex/logs/" >&2
+    echo "WARN: socket 10s 内没出现。看日志: $HOME/.feishu-bot-codex/logs/" >&2
     return 1
 }
 
@@ -141,20 +221,39 @@ wait_for_socket() {
 # -----------------------------------------------------------------------------
 
 action_install() {
-    need_cmd python3 node tmux
-    ensure_lark_cli
+    echo "==> 1. 检查 + 自动装系统依赖"
+    ensure_pkg python3 python@3.12 python3
+    ensure_pkg tmux    tmux         tmux
+    ensure_pkg node    node         nodejs
+
+    echo ""
+    echo "==> 2. 检查 + 自动装 npm 全局工具"
+    ensure_npm_global "@larksuite/cli"           lark-cli
+    ensure_npm_global "@openai/codex" codex
+    if confirm "可选:也装 Claude Code (codex 机器人也能驱动 Claude,加 --agent claude)?"; then
+        ensure_npm_global "@anthropic-ai/claude-code" claude
+    fi
+    if confirm "可选:装 mermaid-cli (让机器人自动把 \`\`\`mermaid 代码块渲染成图)?"; then
+        ensure_npm_global "@mermaid-js/mermaid-cli" mmdc
+    fi
+
+    echo ""
+    echo "==> 3. Python venv + 项目本体"
     install_python_pkg
+
+    echo ""
+    echo "==> 4. CLI 软链 + slash 命令 + 系统服务"
     install_global_symlink
     install_slash_commands
     install_service
     wait_for_socket || true
+
     echo ""
     echo "✅ feishu-bot-codex installed."
-    echo "Next steps:"
+    echo "Next:"
     echo "  cd <your-project>"
-    echo "  feishu-bot-codex shell             # opens tmux + Codex (default)"
-    echo "  feishu-bot-codex shell --agent claude   # or with Claude Code"
-    echo "  /bot-new <name>                    # inside Codex/Claude TUI"
+    echo "  feishu-bot-codex shell    # tmux + Codex (or --agent claude)"
+    echo "  /bot-new <name>            # inside Claude TUI"
 }
 
 action_uninstall() {
@@ -170,7 +269,6 @@ action_uninstall() {
             systemctl --user daemon-reload 2>/dev/null || true
             ;;
     esac
-    # Remove the global symlink (only if it points at our venv)
     for d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
         local link="$d/feishu-bot-codex"
         if [ -L "$link" ] && [[ "$(readlink "$link")" == *"feishu-bot-codex/.venv/bin/feishu-bot-codex"* ]]; then
@@ -179,7 +277,7 @@ action_uninstall() {
         fi
     done
     rm -f "$HOME/.feishu-bot-codex/control.sock"
-    echo "✅ Daemon stopped and service files removed."
+    echo "✅ Daemon stopped + service files removed."
     echo "Bindings preserved at: $HOME/.feishu-bot-codex/bindings.toml"
     echo "Slash commands kept at: $HOME/.claude/commands/bot-*.md"
 }
@@ -189,39 +287,41 @@ action_update() {
     install_python_pkg
     install_slash_commands
     action_doctor
-    echo "✅ Update complete. Daemon will auto-restart on the next file change."
+    echo "✅ Update complete. Daemon will auto-restart on next file change."
 }
 
 action_doctor() {
     echo "[check] python3:           $(command -v python3 || echo MISSING)"
     echo "[check] tmux:              $(command -v tmux || echo MISSING)"
     echo "[check] node:              $(command -v node || echo MISSING)"
+    echo "[check] npm:               $(command -v npm || echo MISSING)"
     echo "[check] lark-cli:          $(command -v lark-cli || echo MISSING)"
     echo "[check] codex:             $(command -v codex || echo MISSING)"
-    echo "[check] claude (optional): $(command -v claude || echo MISSING)"
+    echo "[check] claude (optional): $(command -v claude || echo 'not installed (--agent claude needs it)')"
+    echo "[check] mmdc (optional):   $(command -v mmdc || echo 'not installed (optional)')"
     echo "[check] feishu-bot-codex: $(command -v feishu-bot-codex || echo 'MISSING (run ./setup.sh install)')"
     echo "[check] socket:            $([ -S "$HOME/.feishu-bot-codex/control.sock" ] && echo OK || echo MISSING)"
     echo "[check] bindings.toml:     $([ -f "$HOME/.feishu-bot-codex/bindings.toml" ] && echo OK || echo NONE)"
-    # Daemon must be able to find lark-cli + tmux on its own PATH
     local plist="$HOME/Library/LaunchAgents/com.qingyun.feishu-bot-codex.plist"
     if [ -f "$plist" ]; then
         if grep -q "EnvironmentVariables" "$plist"; then
             echo "[check] launchd PATH env:  OK"
         else
-            echo "[check] launchd PATH env:  MISSING (re-run ./setup.sh install to fix)"
+            echo "[check] launchd PATH env:  MISSING (重跑 ./setup.sh install 修)"
         fi
     fi
     if [ -S "$HOME/.feishu-bot-codex/control.sock" ]; then
         # shellcheck source=/dev/null
         [ -f .venv/bin/activate ] && source .venv/bin/activate
-        feishu-bot-codex ping || echo "WARN: daemon socket exists but ping failed"
+        feishu-bot-codex ping || echo "WARN: socket 在但 ping 失败"
     fi
 }
 
 case "$ACTION" in
-    install)   action_install ;;
+    install)               action_install ;;
     uninstall|--uninstall) action_uninstall ;;
     update|--update)       action_update ;;
     doctor|--doctor)       action_doctor ;;
-    *) echo "Usage: $0 [install|uninstall|update|doctor]" >&2; exit 1 ;;
+    -y|--yes)              action_install ;;
+    *) echo "Usage: $0 [install|uninstall|update|doctor] [-y]" >&2; exit 1 ;;
 esac

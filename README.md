@@ -54,14 +54,19 @@
 ```bash
 git clone https://github.com/957662/feishu-bot-codex ~/project/feishu-bot-codex
 cd ~/project/feishu-bot-codex
-./setup.sh
-# 可选: npm i -g @mermaid-js/mermaid-cli   # 把 ```mermaid 代码块自动渲染成图片插到飞书卡片里
+
+# 全自动:setup.sh 会检测 + 装 brew/python/tmux/node/lark-cli/codex,
+# claude 和 mmdc 可选 — 每个都会问你。一把梭加 -y
+./setup.sh                # 交互式
+./setup.sh install -y     # 全部 Y
+./setup.sh doctor         # 只检测
+
 cd ~/your-project
 
 # 默认起 codex
 feishu-bot-codex shell
 
-# 或者起 claude(同样工作)
+# 或者起 claude(同样工作 — 需要 setup 时选装 Claude Code)
 feishu-bot-codex shell --agent claude
 ```
 
