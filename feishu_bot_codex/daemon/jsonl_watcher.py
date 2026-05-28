@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # How often to poll file size as a safety net. 1 second gives a typewriter-like
 # refresh during active turn (one update_card per second well under Feishu's
 # 50/s rate limit).
-POLL_INTERVAL_SECONDS = 1.0
+POLL_INTERVAL_SECONDS = 0.1
 
 # After this much idle time (no file growth), emit ONE more change so outbound
 # gets a final flush with in_progress=False — otherwise the "生成中…" spinner
@@ -68,7 +68,6 @@ class JsonlWatcher:
             import time
             last_size = -1
             last_change_at = 0.0
-            settled_after_change = False  # have we already fired the "settle" tick?
             try:
                 while not stop_event.is_set():
                     try:
@@ -76,21 +75,19 @@ class JsonlWatcher:
                     except OSError:
                         size = last_size
                     now = time.time()
-                    if size != last_size:
+                    changed = size != last_size
+                    if changed:
                         last_size = size
                         last_change_at = now
-                        settled_after_change = False
-                        if size > 0:
-                            await queue.put(None)
-                    elif (
-                        not settled_after_change
-                        and last_size > 0
-                        and now - last_change_at > SETTLE_AFTER_SECONDS
-                    ):
-                        # File has been quiet long enough → fire one more tick
-                        # so outbound can repaint the card with in_progress=False
-                        # (removing the typewriter cursor / "生成中…" footer).
-                        settled_after_change = True
+                    # Fire a tick while the file is "active" — either it just
+                    # grew, or it grew within the last SETTLE+1s. Outbound
+                    # decides what to do with each tick (advance spinner vs.
+                    # finalize vs. ignore). After the window closes we go
+                    # quiet to avoid useless 10 Hz polling indefinitely.
+                    in_active_window = last_size > 0 and (
+                        changed or now - last_change_at < SETTLE_AFTER_SECONDS + 1.0
+                    )
+                    if in_active_window:
                         await queue.put(None)
                     try:
                         await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL_SECONDS)

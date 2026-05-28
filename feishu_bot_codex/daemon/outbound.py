@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 from feishu_bot_codex.daemon.feishu import LarkCli
+from feishu_bot_codex.daemon.jsonl_watcher import SETTLE_AFTER_SECONDS
 from feishu_bot_codex.daemon.ratelimit import TokenBucket
 from feishu_bot_codex.daemon.state import BindingRuntimeState
 from feishu_bot_codex.rendering.mermaid import default_cache_dir, render_mermaid_to_png
@@ -53,6 +55,16 @@ class OutboundPipeline:
         #   or a path the model fabricated that doesn't actually exist).
         self._image_key_cache: dict[str, str] = {}
         self._failed_image_paths: set[str] = set()
+        # Marks the offset at which we already did a "final" (in_progress=False)
+        # flush. Stops the settle-tick from re-rendering the same finalized
+        # card over and over each polling cycle.
+        self._final_flushed_at_offset: int | None = None
+        # Wall-clock of the last time we ingested new bytes (drives the
+        # "is the turn still alive?" decision for spinner animation).
+        self._last_new_bytes_at: float = 0.0
+        # Wall-clock of the last anim-frame flush (throttles spinner
+        # repaints so we don't hammer Feishu at >10 QPS per card).
+        self._last_anim_flushed_at: float = 0.0
         # Files we've already pushed to the user as standalone messages.
         # Without this, every flush during a long turn would re-send the
         # same file 20× because the path stays in the jsonl tool_result.
@@ -78,12 +90,35 @@ class OutboundPipeline:
             return
         size = self._jsonl_path.stat().st_size
         if size <= self._state.jsonl_offset:
+            # No new bytes. The watcher ticks us at 10 Hz so we can keep the
+            # spinner animating; here we decide between three states:
+            #   1. turn already finalized at this offset → nothing to do
+            #   2. turn idle long enough to be "done" → final flush (clear
+            #      the spinner / 生成中)
+            #   3. turn still potentially streaming → repaint with
+            #      in_progress=True so the spinner advances a frame
+            if self._current_turn is None:
+                return
+            if self._final_flushed_at_offset == self._state.jsonl_offset:
+                return
+            now = time.time()
+            idle = now - self._last_new_bytes_at
+            if idle > SETTLE_AFTER_SECONDS:
+                await self._flush_current_turn(in_progress=False)
+                self._final_flushed_at_offset = self._state.jsonl_offset
+            elif now - self._last_anim_flushed_at > 0.09:
+                await self._flush_current_turn(in_progress=True)
+                self._last_anim_flushed_at = now
             return
 
         with self._jsonl_path.open("rb") as f:
             f.seek(self._state.jsonl_offset)
             new_bytes = f.read()
         self._state.jsonl_offset = size
+        # New bytes arrived → invalidate the "already finalized" marker and
+        # reset the idle clock that gates final-flush.
+        self._final_flushed_at_offset = None
+        self._last_new_bytes_at = time.time()
 
         lines = new_bytes.decode("utf-8", errors="replace").splitlines()
         for line in lines:

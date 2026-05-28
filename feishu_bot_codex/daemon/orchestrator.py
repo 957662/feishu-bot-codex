@@ -231,45 +231,55 @@ class Orchestrator:
                 await self.stop_binding(cwd=cfg.project_dir)
 
     async def restore_from_disk(self) -> list[str]:
-        """Re-attach bindings that were running when the daemon last shut down.
+        """Re-attach every binding that's been used at least once.
 
-        Reads `running-<name>` marker files from data_dir. For each, if the
-        binding still exists and tmux session is alive, calls `start_binding`.
-        Returns the names of bindings that couldn't be restored (stale).
+        We do NOT rely on `running-<name>` marker files anymore. Markers get
+        deleted on daemon shutdown (stop_all → stop_binding → marker.unlink),
+        so a clean restart would orphan every binding until the user manually
+        re-ran `feishu-bot-* start`. Instead we treat the state file
+        (`state-<name>.json` with a persisted `chat_id`) as the source of
+        truth — once a binding has been bootstrapped, it stays "live" until
+        the user explicitly unbinds it.
+
+        A binding is restored if:
+          - it's in BindingStore (`bindings.toml`)
+          - its tmux session is alive (otherwise: stale, user needs to
+            re-run `feishu-bot-* shell` to relaunch the TUI)
+
+        Bindings without a chat_id (never bootstrapped) are also restored so
+        outbound starts watching jsonl immediately; outbound's
+        `_effective_chat_id()` guard ensures no cards are sent until the user
+        gives the bot a first message.
         """
         stale: list[str] = []
-        for marker in self._data_dir.glob("running-*"):
-            name = marker.name[len("running-"):]
-            cfg = self._store.find_by_name(name)
-            if cfg is None:
-                marker.unlink(missing_ok=True)
-                continue
-            tmux = self._tmux_factory(name)
+        for cfg in self._store.all():
+            tmux = self._tmux_factory(cfg.name)
             if not tmux.has_session(cfg.tmux_session):
-                stale.append(name)
-                marker.unlink(missing_ok=True)
+                stale.append(cfg.name)
+                # Clean up any leftover marker
+                (self._data_dir / f"running-{cfg.name}").unlink(missing_ok=True)
                 continue
-            data: dict = {}
+            # Prefer the jsonl path from the marker if still present (it pins
+            # the daemon to the exact file in use). Otherwise re-guess.
+            jsonl_path = None
+            marker = self._data_dir / f"running-{cfg.name}"
+            if marker.exists():
+                try:
+                    data = json.loads(marker.read_text())
+                    jsonl_path_str = data.get("jsonl_path", "")
+                    if jsonl_path_str:
+                        jsonl_path = Path(jsonl_path_str)
+                except Exception:
+                    pass
             try:
-                data = json.loads(marker.read_text())
+                await self.start_binding(cwd=cfg.project_dir, jsonl_path=jsonl_path)
             except Exception:
-                pass
-            jsonl_path_str = data.get("jsonl_path", "")
-            jsonl_path = Path(jsonl_path_str) if jsonl_path_str else None
-            await self.start_binding(cwd=cfg.project_dir, jsonl_path=jsonl_path)
+                logger.exception("failed to restore binding %s", cfg.name)
+                stale.append(cfg.name)
         return stale
 
     def _guess_jsonl_path(self, cfg: BindingConfig) -> Path:
-        """Find the newest session jsonl for cfg.project_dir across BOTH backends.
-
-        - Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, scan for one
-          whose session_meta.payload.cwd matches.
-        - Claude: ~/.claude/projects/-<encoded-cwd>/*.jsonl (cwd in dir name).
-
-        Picks the most-recently-modified across both. Returns a sentinel path
-        if neither side has a session yet; the polling watcher will detect
-        creation later.
-        """
+        """Find newest jsonl across BOTH backends (~/.codex + ~/.claude)."""
         import json
         home = Path.home()
         candidates: list[Path] = []
