@@ -255,7 +255,7 @@ async def handle_bind_with_orchestrator(
             binding = BindingConfig(
                 name=name,
                 project_dir=cwd,
-                tmux_session=f"claude-{name}",
+                tmux_session=f"codex-{name}",
                 feishu_app_id=app_id,
                 secret_ref=secret_ref,
                 created_at=datetime.now(timezone.utc),

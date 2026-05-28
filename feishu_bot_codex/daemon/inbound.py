@@ -381,11 +381,11 @@ class InboundPipeline:
         return None
 
     async def _download_image(self, message_id: str, image_key: str) -> str | None:
-        """Download one image to ~/.feishu-bot-claude/inbox/. Returns abs path or None."""
+        """Download one image to ~/.feishu-bot-codex/inbox/. Returns abs path or None."""
         if not message_id or not image_key:
             return None
         # Stash images per-binding so two bindings don't trample each other.
-        inbox = Path.home() / ".feishu-bot-claude" / "inbox" / self._tmux_session
+        inbox = Path.home() / ".feishu-bot-codex" / "inbox" / self._tmux_session
         inbox.mkdir(parents=True, exist_ok=True)
         out_path = inbox / f"{int(time.time())}-{image_key}.png"
         try:
@@ -448,7 +448,7 @@ class InboundPipeline:
     async def _download_file(self, message_id: str, file_key: str, file_name: str) -> str | None:
         if not message_id or not file_key:
             return None
-        inbox = Path.home() / ".feishu-bot-claude" / "inbox" / self._tmux_session
+        inbox = Path.home() / ".feishu-bot-codex" / "inbox" / self._tmux_session
         inbox.mkdir(parents=True, exist_ok=True)
         # Keep the original extension when we know it. Sanitize to avoid
         # path traversal: only the basename is used.

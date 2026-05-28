@@ -201,10 +201,10 @@ def config(ctx, cwd, kv):
 def _resolve_tmux_session(socket_path: Path, cwd: Path) -> str:
     """Ask daemon for the tmux_session name bound to `cwd`.
 
-    Falls back to `claude-<basename(cwd)>` if no binding exists or daemon
+    Falls back to `codex-<basename(cwd)>` if no binding exists or daemon
     is unreachable — keeps `shell` usable in pre-bind exploration.
     """
-    fallback = f"claude-{cwd.name}"
+    fallback = f"codex-{cwd.name}"
     cwd_resolved = str(cwd.resolve())
 
     async def _ask():
@@ -237,7 +237,7 @@ def shell(ctx, cwd, agent, extra_args):
 
     The tmux session name is resolved from the daemon's binding for this cwd
     when one exists (so /bot-start and the shell agree). Falls back to
-    `claude-<basename(cwd)>` for unbound projects.
+    `codex-<basename(cwd)>` for unbound projects.
 
     Args after `--` are forwarded to the agent binary.
     Examples:
