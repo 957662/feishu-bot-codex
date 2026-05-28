@@ -31,6 +31,17 @@ class Tmux(ABC):
         """
 
     @abstractmethod
+    def send_special(self, session: str, key: str) -> None:
+        """Send a single special key by name. Supported names:
+
+        Escape, Enter, Tab, BSpace, Up, Down, Left, Right,
+        M-Enter (Alt+Enter, soft newline in Claude/Codex input box),
+        C-c (Ctrl+C), C-d (Ctrl+D), C-l (Ctrl+L), C-u (Ctrl+U).
+
+        Implementations translate to the underlying multiplexer's key syntax.
+        """
+
+    @abstractmethod
     def kill_session(self, name: str) -> None:
         """Kill the session. No-op if missing."""
 
@@ -66,6 +77,11 @@ class FakeTmux(Tmux):
         if session not in self._sessions:
             raise RuntimeError(f"no session: {session!r}")
         self.calls.append(("send_keys", {"session": session, "keys": keys}))
+
+    def send_special(self, session: str, key: str) -> None:
+        if session not in self._sessions:
+            raise RuntimeError(f"no session: {session!r}")
+        self.calls.append(("send_special", {"session": session, "key": key}))
 
     def kill_session(self, name: str) -> None:
         self.calls.append(("kill_session", {"name": name}))
@@ -143,6 +159,24 @@ class RealTmux(Tmux):
                 ):
                     raise RuntimeError(f"no session: {session!r}")
                 raise RuntimeError(f"tmux send-keys Enter failed: {msg}")
+
+    def send_special(self, session: str, key: str) -> None:
+        """Send a tmux-syntax key (Escape, Up, C-c, M-Enter, etc.) — NOT literal."""
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", session, key],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            msg = result.stderr.strip()
+            lower = msg.lower()
+            if (
+                "can't find session" in lower
+                or "can't find pane" in lower
+                or "no session" in lower
+                or "session not found" in lower
+            ):
+                raise RuntimeError(f"no session: {session!r}")
+            raise RuntimeError(f"tmux send-special {key!r} failed: {msg}")
 
     def kill_session(self, name: str) -> None:
         result = subprocess.run(

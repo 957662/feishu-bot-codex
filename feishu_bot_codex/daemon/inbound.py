@@ -1,4 +1,4 @@
-"""Inbound pipeline: Feishu events → tmux send-keys (text/slash/menu/image)."""
+"""Inbound pipeline: Feishu events → tmux send-keys (text/slash/menu/image/key)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,40 @@ from pathlib import Path
 
 from feishu_bot_codex.daemon.feishu import LarkCli
 from feishu_bot_codex.daemon.tmux import Tmux
+
+
+# `!<word>` from Feishu → tmux/zellij special key. Case-insensitive, also
+# accepts a small set of Chinese aliases so users can type "!中断" / "!上"
+# without leaving Chinese input mode. The user-facing word is intentionally
+# short — these are typed dozens of times a session.
+KEY_COMMANDS: dict[str, str] = {
+    # Cancel / interrupt current model turn (Esc in Claude / Codex)
+    "esc": "Escape", "cancel": "Escape", "interrupt": "Escape",
+    "中断": "Escape", "取消": "Escape", "停": "Escape",
+    # Hard exit (Ctrl-C, twice usually quits the TUI)
+    "^c": "C-c", "ctrl-c": "C-c", "exit": "C-c", "quit": "C-c", "退出": "C-c",
+    # Other Ctrl combos
+    "^d": "C-d", "ctrl-d": "C-d",
+    "^l": "C-l", "clear-screen": "C-l",
+    "^u": "C-u", "kill-line": "C-u",
+    # Arrows / history navigation
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "上": "Up", "下": "Down", "左": "Left", "右": "Right",
+    # Tab (completion)
+    "tab": "Tab", "补全": "Tab",
+    # Backspace
+    "bs": "BSpace", "backspace": "BSpace", "删": "BSpace",
+    # Bare Enter (for prompts already showing on screen)
+    "enter": "Enter", "回车": "Enter",
+}
+
+
+# Common Y/N confirmation shortcuts. These send the letter + Enter atomically,
+# so a flying-permission prompt can be answered with `!y` / `!n` / `!是` / `!否`.
+YESNO_COMMANDS: dict[str, str] = {
+    "y": "y", "yes": "y", "是": "y", "确认": "y", "ok": "y", "好": "y",
+    "n": "n", "no": "n", "否": "n", "不": "n", "cancel-no": "n",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +67,8 @@ class InboundPipeline:
         tmux: Tmux,
         lark: LarkCli,
         menu_command_map: dict[str, str] | None = None,
+        menu_special_map: dict[str, str] | None = None,
+        menu_yesno_map: dict[str, str] | None = None,
         allow_users: set[str] | None = None,
         max_message_length: int = 8000,
         event_key: str = "im.message.receive_v1",
@@ -43,6 +79,8 @@ class InboundPipeline:
         self._tmux = tmux
         self._lark = lark
         self._menu_command_map = menu_command_map or {}
+        self._menu_special_map = menu_special_map or {}
+        self._menu_yesno_map = menu_yesno_map or {}
         self._allow_users = allow_users
         self._max_message_length = max_message_length
         self._event_key = event_key
@@ -155,6 +193,12 @@ class InboundPipeline:
         if not text:
             return
 
+        # ---- Keyboard / control commands (! prefix) ----
+        # Single-token `!<word>` → special key (Esc / Up / Down / Tab / ...).
+        # `!y` / `!n` / `!是` / `!否` → write letter + Enter (one-tap y/n).
+        if await self._maybe_handle_key_command(text, message_id):
+            return
+
         # Inline images inside a text message: lark-cli's text converter
         # rewrites embedded image elements to "[Image: img_xxx]". Scan for
         # that pattern, download each, and replace with the absolute path.
@@ -162,34 +206,73 @@ class InboundPipeline:
 
         if len(text) > self._max_message_length:
             text = text[: self._max_message_length] + "\n...[truncated]"
-        # Ack the user's message with a reaction so they see Claude received
-        # it immediately (before Claude finishes generating a reply). Done
-        # as fire-and-forget — reaction failure must not block forwarding.
-        # See full emoji_type list at
-        # open.feishu.cn/.../message-reaction/emojis-introduce
+        # Ack the user's message with a reaction so they see Claude received it.
         if message_id:
             asyncio.create_task(self._react_quietly(message_id, "LOVE"))
-        # Codex TUI swallows the immediate Enter after a paste because of its
-        # completion popup. Send body and Enter separately with a brief gap
-        # so codex's input box has time to settle. (Same workaround as
-        # _handle_image — applies to all text injections.)
-        self._tmux.send_keys(session=self._tmux_session, keys=text)
+        # Inject the body. Multi-line text uses Alt+Enter as a soft newline
+        # so the TUI sees each \n as "next line of input" instead of "submit
+        # now"; the final Enter commits the whole thing.
+        await self._inject_multiline_text(text)
+
+    async def _maybe_handle_key_command(self, text: str, message_id: str) -> bool:
+        """If `text` is a `!<word>` keyboard command, dispatch it and return True."""
+        stripped = text.strip()
+        if not stripped.startswith("!"):
+            return False
+        word = stripped[1:].strip().lower()
+        if not word:
+            return False
+
+        special = KEY_COMMANDS.get(word)
+        if special is not None:
+            try:
+                self._tmux.send_special(session=self._tmux_session, key=special)
+                if message_id:
+                    asyncio.create_task(self._react_quietly(message_id, "OK"))
+                logger.info("key command %r → %s", word, special)
+            except Exception as e:
+                logger.warning("send_special %r failed: %s", special, e)
+            return True
+
+        yn = YESNO_COMMANDS.get(word)
+        if yn is not None:
+            try:
+                self._tmux.send_keys(session=self._tmux_session, keys=yn)
+                await asyncio.sleep(0.2)
+                self._tmux.send_special(session=self._tmux_session, key="Enter")
+                if message_id:
+                    asyncio.create_task(self._react_quietly(message_id, "OK"))
+                logger.info("yes/no command %r → %r", word, yn)
+            except Exception as e:
+                logger.warning("y/n %r failed: %s", word, e)
+            return True
+
+        # `!` prefix but unrecognized — log + react with question; fall through
+        # to normal text injection so we don't silently drop user input.
+        logger.info("unknown key command %r — treating as literal text", word)
+        if message_id:
+            asyncio.create_task(self._react_quietly(message_id, "QUESTION"))
+        return False
+
+    async def _inject_multiline_text(self, text: str) -> None:
+        """Type text into the TUI, preserving line breaks via Alt+Enter."""
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                self._tmux.send_keys(session=self._tmux_session, keys=line)
+                await asyncio.sleep(0.05)
+            if i < len(lines) - 1:
+                # Soft newline inside the TUI input box. Both Claude Code
+                # and Codex map M-Enter (Alt+Enter) to "add a new line to
+                # the current message", not "submit".
+                self._tmux.send_special(session=self._tmux_session, key="M-Enter")
+                await asyncio.sleep(0.05)
+        # Settle, then commit.
         await asyncio.sleep(0.4)
-        self._tmux.send_keys(session=self._tmux_session, keys="\n")
+        self._tmux.send_special(session=self._tmux_session, key="Enter")
 
     async def _handle_image(self, message_id: str, content_raw) -> None:
-        """Standalone image message: download + inject absolute file path.
-
-        Codex CLI quirks we work around:
-        1. Input starting with `/` triggers slash-command parsing — a bare
-           absolute path gets rejected as an unknown slash command.
-        2. The input box doesn't auto-submit on raw paste of a long path
-           (Enter gets swallowed by an internal completion popup).
-
-        Solution: prefix with "Image: " so codex parses as plain text, then
-        sleep briefly to let codex auto-detect the embedded absolute path,
-        then send Enter separately.
-        """
+        """Standalone image message: download + inject absolute file path."""
         image_key = self._extract_image_key(content_raw)
         if not image_key:
             logger.warning("image message %s missing image_key; content=%r", message_id, content_raw)
@@ -197,12 +280,9 @@ class InboundPipeline:
         path = await self._download_image(message_id, image_key)
         if path is None:
             return
-        # Type the body (no trailing newline yet)
-        self._tmux.send_keys(session=self._tmux_session, keys=f"Image: {path}")
-        # Give codex's path detector time to attach the image
-        await asyncio.sleep(0.4)
-        # Commit
-        self._tmux.send_keys(session=self._tmux_session, keys="\n")
+        # Send the absolute path as input text. Claude / Codex parse pasted
+        # paths as image attachments.
+        self._tmux.send_keys(session=self._tmux_session, keys=path + "\n")
 
     async def _inline_images(self, message_id: str, text: str) -> str:
         """Replace any `[Image: img_xxx]` occurrences in text with downloaded paths."""
@@ -245,11 +325,11 @@ class InboundPipeline:
         return None
 
     async def _download_image(self, message_id: str, image_key: str) -> str | None:
-        """Download one image to ~/.feishu-bot-codex/inbox/. Returns abs path or None."""
+        """Download one image to ~/.feishu-bot-claude/inbox/. Returns abs path or None."""
         if not message_id or not image_key:
             return None
         # Stash images per-binding so two bindings don't trample each other.
-        inbox = Path.home() / ".feishu-bot-codex" / "inbox" / self._tmux_session
+        inbox = Path.home() / ".feishu-bot-claude" / "inbox" / self._tmux_session
         inbox.mkdir(parents=True, exist_ok=True)
         out_path = inbox / f"{int(time.time())}-{image_key}.png"
         try:
@@ -275,12 +355,32 @@ class InboundPipeline:
         if self._allow_users is not None and sender not in self._allow_users:
             return
         event_key = ev.get("event_key", "")
+
+        # 1. Special key (Escape / Up / C-c / ...)
+        special = self._menu_special_map.get(event_key)
+        if special is not None:
+            try:
+                self._tmux.send_special(session=self._tmux_session, key=special)
+            except Exception as e:
+                logger.warning("menu special %r failed: %s", special, e)
+            return
+
+        # 2. Yes/No shortcut (letter + Enter)
+        yn = self._menu_yesno_map.get(event_key)
+        if yn is not None:
+            try:
+                self._tmux.send_keys(session=self._tmux_session, keys=yn)
+                await asyncio.sleep(0.2)
+                self._tmux.send_special(session=self._tmux_session, key="Enter")
+            except Exception as e:
+                logger.warning("menu y/n %r failed: %s", yn, e)
+            return
+
+        # 3. Text command (slash etc.)
         command = self._menu_command_map.get(event_key)
         if command is None:
             logger.info("unknown menu event_key: %s", event_key)
             return
-        # Same split-send pattern as _handle_message — codex's completion
-        # popup sometimes swallows an immediately-following Enter.
         self._tmux.send_keys(session=self._tmux_session, keys=command)
-        await asyncio.sleep(0.4)
-        self._tmux.send_keys(session=self._tmux_session, keys="\n")
+        await asyncio.sleep(0.2)
+        self._tmux.send_special(session=self._tmux_session, key="Enter")

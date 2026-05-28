@@ -102,10 +102,18 @@ class Orchestrator:
         def _on_chat_discovered(chat_id: str):
             return outbound.bootstrap_with_chat_id(chat_id)
 
+        from feishu_bot_codex.menu_template import (
+            DEFAULT_MENU_COMMAND_MAP,
+            DEFAULT_MENU_SPECIAL_MAP,
+            DEFAULT_MENU_YESNO_MAP,
+        )
         inbound = InboundPipeline(
             tmux_session=cfg.tmux_session,
             tmux=tmux,
             lark=lark,
+            menu_command_map=DEFAULT_MENU_COMMAND_MAP,
+            menu_special_map=DEFAULT_MENU_SPECIAL_MAP,
+            menu_yesno_map=DEFAULT_MENU_YESNO_MAP,
             allow_users=set(cfg.allow_users) if cfg.allow_users else None,
             max_message_length=cfg.max_message_length,
             on_chat_id_discovered=_on_chat_discovered,
@@ -188,53 +196,14 @@ class Orchestrator:
         return stale
 
     def _guess_jsonl_path(self, cfg: BindingConfig) -> Path:
-        """Find the newest session jsonl for `cfg.project_dir`.
-
-        Looks at both backends and picks the most-recently-modified:
-        - **Codex**: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. File names
-          don't encode cwd, so we sniff the first line's `session_meta.payload.cwd`
-          to match (also accepts files starting with the cwd as `payload.cwd`).
-        - **Claude**: `~/.claude/projects/-<encoded-cwd>/*.jsonl` (single dir,
-          file name encodes cwd).
-
-        Returns a sentinel path if no session found yet (the daemon will tail
-        it once Claude/Codex starts writing).
-        """
-        import json
+        """Find newest jsonl in ~/.claude/projects/<encoded-cwd>/ — mtime-based."""
         home = Path.home()
-        candidates: list[Path] = []
-
-        # ---- Codex ----
-        sessions_root = home / ".codex" / "sessions"
-        if sessions_root.exists():
-            for path in sessions_root.glob("*/*/*/rollout-*.jsonl"):
-                try:
-                    with path.open("r", encoding="utf-8") as f:
-                        first = f.readline().strip()
-                    if not first:
-                        continue
-                    meta = json.loads(first)
-                    if meta.get("type") != "session_meta":
-                        continue
-                    if meta.get("payload", {}).get("cwd") == cfg.project_dir:
-                        candidates.append(path)
-                except Exception:
-                    # Corrupt / unreadable jsonl — skip silently.
-                    continue
-
-        # ---- Claude ----
         encoded = cfg.project_dir.replace("/", "-").lstrip("-")
-        claude_dir = home / ".claude" / "projects" / f"-{encoded}"
-        if claude_dir.exists():
-            candidates.extend(claude_dir.glob("*.jsonl"))
-
-        if not candidates:
-            # Nothing yet. Return a Codex-shaped sentinel; the watcher will
-            # block until the file appears.
-            return sessions_root / "no-session.jsonl" if sessions_root.exists() else claude_dir / "no-session.jsonl"
-
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates[0]
+        projects_dir = home / ".claude" / "projects" / f"-{encoded}"
+        if not projects_dir.exists():
+            return projects_dir / "no-session.jsonl"
+        candidates = sorted(projects_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0] if candidates else projects_dir / "no-session.jsonl"
 
     async def _outbound_loop(self, running: RunningBinding, jsonl_path: Path, state_path: Path) -> None:
         """Watch jsonl, process new bytes on each change, persist state."""

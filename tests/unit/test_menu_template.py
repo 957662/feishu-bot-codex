@@ -3,8 +3,8 @@
 from feishu_bot_codex.menu_template import DEFAULT_MENU, build_menu_json
 
 
-def test_default_menu_has_5_top_level_groups():
-    assert len(DEFAULT_MENU) == 5
+def test_default_menu_has_top_level_groups():
+    assert len(DEFAULT_MENU) == 6  # 会话/配置/工具/信息/控制/桥接
 
 
 def test_total_buttons_within_limit():
@@ -31,7 +31,7 @@ def test_event_keys_unique():
 def test_build_menu_json_structure():
     out = build_menu_json()
     assert "menu_items" in out
-    assert len(out["menu_items"]) == 5
+    assert len(out["menu_items"]) == 6
     first_group = out["menu_items"][0]
     assert "label" in first_group
     assert "children" in first_group

@@ -46,10 +46,14 @@ async def test_inbound_routes_text_to_tmux():
     )
     await pipeline.process_until_idle(max_events=1)
 
-    send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    # Codex split-send: body sent, then Enter sent separately.
-    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
-    assert keys_seq == "hello claude\n"
+    # New split-send: text body via send_keys, Enter via send_special.
+    send_calls = [c for c in tmux.calls if c[0] in ("send_keys", "send_special")]
+    typed = "".join(
+        c[1].get("keys", "") if c[0] == "send_keys" else
+        ("\n" if c[1]["key"] == "Enter" else "")
+        for c in send_calls
+    )
+    assert typed == "hello claude\n"
 
 
 @pytest.mark.asyncio
@@ -64,9 +68,13 @@ async def test_inbound_routes_slash_command_to_tmux():
     )
     await pipeline.process_until_idle(max_events=1)
 
-    send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
-    assert keys_seq == "/compact\n"
+    send_calls = [c for c in tmux.calls if c[0] in ("send_keys", "send_special")]
+    typed = "".join(
+        c[1].get("keys", "") if c[0] == "send_keys" else
+        ("\n" if c[1]["key"] == "Enter" else "")
+        for c in send_calls
+    )
+    assert typed == "/compact\n"
 
 
 @pytest.mark.asyncio
@@ -82,11 +90,13 @@ async def test_inbound_routes_menu_button_to_command():
     )
     await pipeline.process_until_idle(max_events=1)
 
-    send_keys_calls = [c for c in tmux.calls if c[0] == "send_keys"]
-    # Split-send: codex's completion popup eats an immediately-following
-    # Enter, so we send the command body and the Enter as two calls.
-    keys_seq = "".join(c[1]["keys"] for c in send_keys_calls)
-    assert keys_seq == "/clear\n"
+    send_calls = [c for c in tmux.calls if c[0] in ("send_keys", "send_special")]
+    typed = "".join(
+        c[1].get("keys", "") if c[0] == "send_keys" else
+        ("\n" if c[1]["key"] == "Enter" else "")
+        for c in send_calls
+    )
+    assert typed == "/clear\n"
 
 
 @pytest.mark.asyncio

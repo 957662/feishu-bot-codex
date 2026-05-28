@@ -46,6 +46,17 @@ DEFAULT_MENU: list[dict] = [
         ],
     },
     {
+        "label": "控制",
+        "children": [
+            {"event_key": "key_cancel", "label": "✋ 中断"},
+            {"event_key": "key_yes", "label": "✅ 确认 y"},
+            {"event_key": "key_no", "label": "❌ 拒绝 n"},
+            {"event_key": "key_exit", "label": "🛑 退出"},
+            {"event_key": "key_up", "label": "⬆ 上一条"},
+            {"event_key": "key_down", "label": "⬇ 下一条"},
+        ],
+    },
+    {
         "label": "桥接",
         "children": [
             {"event_key": "bridge_pause", "label": "暂停镜像"},
@@ -55,6 +66,24 @@ DEFAULT_MENU: list[dict] = [
         ],
     },
 ]
+
+
+# event_key → special key name (for tmux/zellij send_special), in addition
+# to DEFAULT_MENU_COMMAND_MAP (which contains text-to-inject commands).
+DEFAULT_MENU_SPECIAL_MAP: dict[str, str] = {
+    "key_cancel": "Escape",
+    "key_exit": "C-c",
+    "key_up": "Up",
+    "key_down": "Down",
+}
+
+
+# event_key → "y" or "n" letter that should be typed and then committed
+# with Enter (one-shot permission prompt answer).
+DEFAULT_MENU_YESNO_MAP: dict[str, str] = {
+    "key_yes": "y",
+    "key_no": "n",
+}
 
 
 # Map event_key → tmux keystrokes for slash commands (consumed by InboundPipeline)
