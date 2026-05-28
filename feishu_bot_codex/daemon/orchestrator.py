@@ -107,6 +107,24 @@ class Orchestrator:
             DEFAULT_MENU_SPECIAL_MAP,
             DEFAULT_MENU_YESNO_MAP,
         )
+        from feishu_bot_codex.rendering.status import build_status_card, build_help_card
+
+        # !status / !help callbacks — closures that capture binding context.
+        def _status_card() -> dict:
+            return build_status_card(
+                binding_name=cfg.name,
+                project_dir=cfg.project_dir,
+                tmux_session=cfg.tmux_session,
+                feishu_app_id=cfg.feishu_app_id,
+                render_style=cfg.render_style,
+                jsonl_path=jsonl_path,
+                chat_id=state.chat_id,
+            )
+        def _help_card() -> dict:
+            return build_help_card(binding_name=cfg.name)
+        def _current_chat_id() -> str:
+            return state.chat_id
+
         inbound = InboundPipeline(
             tmux_session=cfg.tmux_session,
             tmux=tmux,
@@ -117,6 +135,9 @@ class Orchestrator:
             allow_users=set(cfg.allow_users) if cfg.allow_users else None,
             max_message_length=cfg.max_message_length,
             on_chat_id_discovered=_on_chat_discovered,
+            status_card_builder=_status_card,
+            help_card_builder=_help_card,
+            chat_id_provider=_current_chat_id,
             # If state already has chat_id (prior bootstrap), skip the
             # "consume first message" behavior on this restart.
             bootstrap_complete=bool(state.chat_id),

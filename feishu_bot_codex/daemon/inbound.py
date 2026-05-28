@@ -74,6 +74,9 @@ class InboundPipeline:
         event_key: str = "im.message.receive_v1",
         on_chat_id_discovered=None,
         bootstrap_complete: bool = False,
+        status_card_builder=None,
+        help_card_builder=None,
+        chat_id_provider=None,
     ) -> None:
         self._tmux_session = tmux_session
         self._tmux = tmux
@@ -95,6 +98,13 @@ class InboundPipeline:
         # we don't double-forward the same user message to Claude.
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_event_ids_max = 1024
+        # Optional callbacks for `!status` / `!help` self-reporting cards.
+        # `status_card_builder()` returns a dict (the rendered card JSON).
+        # `chat_id_provider()` returns the binding's chat_id at call time
+        # (so it picks up post-bootstrap state without re-binding).
+        self._status_card_builder = status_card_builder
+        self._help_card_builder = help_card_builder
+        self._chat_id_provider = chat_id_provider
 
     async def process_until_idle(self, max_events: int = 0) -> None:
         """Consume events until the fake queue drains or max_events hit."""
@@ -175,6 +185,15 @@ class InboundPipeline:
                 asyncio.create_task(self._react_quietly(message_id, "LOVE"))
             return
 
+        # ---- File messages (.pdf / .txt / .py / .md / etc.) ----
+        # Same idea as image: download into inbox, inject absolute path as
+        # text so the TUI's @file_reference parser picks it up.
+        if message_type == "file":
+            await self._handle_file(message_id, content_raw)
+            if message_id:
+                asyncio.create_task(self._react_quietly(message_id, "LOVE"))
+            return
+
         if message_type != "text":
             logger.info("skipping non-text message type: %s", message_type)
             return
@@ -222,6 +241,14 @@ class InboundPipeline:
         word = stripped[1:].strip().lower()
         if not word:
             return False
+
+        # Status / help — sent BACK to the user as a card, not to the TUI.
+        if word in ("status", "state", "状态", "现状"):
+            await self._send_status_card(message_id)
+            return True
+        if word in ("help", "帮助", "?", "？"):
+            await self._send_help_card(message_id)
+            return True
 
         special = KEY_COMMANDS.get(word)
         if special is not None:
@@ -343,11 +370,111 @@ class InboundPipeline:
             logger.warning("image download failed (msg=%s key=%s): %s", message_id, image_key, e)
             return None
 
+    async def _handle_file(self, message_id: str, content_raw) -> None:
+        """File message → download to inbox + inject absolute path into TUI."""
+        info = self._extract_file_info(content_raw)
+        if not info:
+            logger.warning("file message %s missing file_key; content=%r", message_id, content_raw)
+            return
+        file_key, file_name = info
+        path = await self._download_file(message_id, file_key, file_name)
+        if path is None:
+            return
+        # Same split-send pattern as text — type the body, wait, then Enter.
+        # Prefix with "File:" so codex doesn't interpret a leading `/` (from
+        # the absolute path) as a slash command.
+        self._tmux.send_keys(session=self._tmux_session, keys=f"File: {path}")
+        await asyncio.sleep(0.4)
+        self._tmux.send_special(session=self._tmux_session, key="Enter")
+
+    @staticmethod
+    def _extract_file_info(content_raw) -> tuple[str, str] | None:
+        """Pull (file_key, file_name) out of a file message's content."""
+        if content_raw is None:
+            return None
+        if isinstance(content_raw, dict):
+            key = content_raw.get("file_key")
+            name = content_raw.get("file_name", "")
+            return (key, name) if key else None
+        if isinstance(content_raw, str):
+            stripped = content_raw.strip()
+            if stripped.startswith("{"):
+                try:
+                    d = json.loads(stripped)
+                    key = d.get("file_key")
+                    if key:
+                        return (key, d.get("file_name", ""))
+                except json.JSONDecodeError:
+                    pass
+            # lark-cli's text rendering wraps file as <file key="file_xxx" name="..."/>
+            m = re.search(r'file\s+key="(file_[A-Za-z0-9_-]+)"(?:\s+name="([^"]*)")?', stripped)
+            if m:
+                return (m.group(1), m.group(2) or "")
+            # bare file_xxx token
+            m = re.search(r'(file_[A-Za-z0-9_-]+)', stripped)
+            if m:
+                return (m.group(1), "")
+        return None
+
+    async def _download_file(self, message_id: str, file_key: str, file_name: str) -> str | None:
+        if not message_id or not file_key:
+            return None
+        inbox = Path.home() / ".feishu-bot-claude" / "inbox" / self._tmux_session
+        inbox.mkdir(parents=True, exist_ok=True)
+        # Keep the original extension when we know it. Sanitize to avoid
+        # path traversal: only the basename is used.
+        safe_name = os.path.basename(file_name) if file_name else file_key
+        # Strip any path separators just in case
+        safe_name = safe_name.replace("/", "_").replace("\\", "_")
+        if not safe_name:
+            safe_name = file_key
+        out_path = inbox / f"{int(time.time())}-{safe_name}"
+        try:
+            return await self._lark.download_message_resource(
+                message_id=message_id,
+                file_key=file_key,
+                out_path=str(out_path),
+                resource_type="file",
+            )
+        except Exception as e:
+            logger.warning("file download failed (msg=%s key=%s): %s", message_id, file_key, e)
+            return None
+
     async def _react_quietly(self, message_id: str, emoji_type: str) -> None:
         try:
             await self._lark.add_reaction(message_id, emoji_type)
         except Exception as e:
             logger.warning("add_reaction failed for message %s: %s", message_id, e)
+
+    async def _send_status_card(self, message_id: str) -> None:
+        """Build + push a status card back to the binding's chat."""
+        if self._status_card_builder is None or self._chat_id_provider is None:
+            logger.info("!status requested but no builder/chat_id provider configured")
+            return
+        chat_id = self._chat_id_provider()
+        if not chat_id:
+            return
+        try:
+            card = self._status_card_builder()
+            await self._lark.send_card(chat_id=chat_id, card=card)
+            if message_id:
+                asyncio.create_task(self._react_quietly(message_id, "OK"))
+        except Exception as e:
+            logger.warning("send status card failed: %s", e)
+
+    async def _send_help_card(self, message_id: str) -> None:
+        if self._help_card_builder is None or self._chat_id_provider is None:
+            return
+        chat_id = self._chat_id_provider()
+        if not chat_id:
+            return
+        try:
+            card = self._help_card_builder()
+            await self._lark.send_card(chat_id=chat_id, card=card)
+            if message_id:
+                asyncio.create_task(self._react_quietly(message_id, "OK"))
+        except Exception as e:
+            logger.warning("send help card failed: %s", e)
 
     async def _handle_menu(self, event: dict) -> None:
         ev = event.get("event", {})

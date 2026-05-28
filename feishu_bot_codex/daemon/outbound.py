@@ -85,8 +85,8 @@ class OutboundPipeline:
 
     async def _handle_event(self, event: JsonlEvent) -> None:
         if event.role == "user" and not event.has_only_tool_results():
-            # User event closes the previous turn → flush it.
-            await self._flush_current_turn()
+            # User event closes the previous turn → flush as FINAL (no spinner).
+            await self._flush_current_turn(in_progress=False)
             self._current_turn = Turn(user_event=event)
             self._state.reset_current_turn()
             return
@@ -96,16 +96,35 @@ class OutboundPipeline:
 
         self._current_turn.assistant_events.append(event)
 
-    async def _flush_current_turn(self) -> None:
-        """Render and send the current turn as a single card. No-op on empty."""
+    async def _flush_current_turn(self, in_progress: bool = True) -> None:
+        """Render and send the current turn as a single card.
+
+        `in_progress=True` (the default, used for batch-end flushes during
+        active streaming) adds a "⏳ 思考中…" pacer to the card. The next
+        batch-end flush rewrites the card; once a new user event arrives,
+        the turn is flushed one final time WITHOUT the pacer.
+
+        We also treat a turn as "settled" (i.e. NOT in_progress) when the
+        jsonl hasn't been written for >5 seconds — covers the case where
+        the very last batch happens to be the model's final output.
+        """
         if self._current_turn is None:
             return
         chat_id = self._effective_chat_id()
         if not chat_id:
             return
 
+        # Liveness heuristic: jsonl mtime within last 5s → still streaming.
+        if in_progress and self._jsonl_path.exists():
+            import time as _time
+            try:
+                age = _time.time() - self._jsonl_path.stat().st_mtime
+                if age > 5.0:
+                    in_progress = False
+            except OSError:
+                pass
+
         # Upload any images referenced in this turn so the card can embed them.
-        # Failures are tolerated — the path stays in the markdown as text.
         image_keys = await self._upload_turn_images(self._current_turn)
 
         card = render_turn_to_card(
@@ -113,6 +132,7 @@ class OutboundPipeline:
             project_name=self._project_name,
             render_style=self._render_style,
             image_keys=image_keys,
+            in_progress=in_progress,
         )
         if not card.get("body", {}).get("elements"):
             return
