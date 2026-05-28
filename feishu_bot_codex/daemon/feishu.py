@@ -216,10 +216,25 @@ class RealLarkCli(LarkCli):
     runs a fresh subprocess.
     """
 
-    def __init__(self, binary: str = "lark-cli", as_bot: bool = True, extra_env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        binary: str = "lark-cli",
+        as_bot: bool = True,
+        extra_env: dict[str, str] | None = None,
+        ws_app_id: str | None = None,
+        ws_app_secret: str | None = None,
+        ws_domain: str = "https://open.feishu.cn",
+    ) -> None:
         self._binary = binary
         self._as_bot = as_bot
         self._extra_env = dict(extra_env or {})
+        # If WS credentials are provided, consume_events() uses lark-oapi over
+        # WebSocket (covering message + menu + card.action events). Without
+        # them, falls back to the lark-cli subprocess path (message only).
+        self._ws_app_id = ws_app_id
+        self._ws_app_secret = ws_app_secret
+        self._ws_domain = ws_domain
+        self._ws_consumer = None
 
     async def _run_raw(self, args: list[str], timeout: float = 30.0) -> tuple[str, int]:
         """Run `lark-cli <args>`. Return (combined stdout+stderr, returncode).
@@ -511,6 +526,28 @@ class RealLarkCli(LarkCli):
         return self._extract_message_id(out)
 
     async def consume_events(self, event_key: str, max_events: int = 0) -> AsyncIterator[dict]:
+        # Prefer the WebSocket path (lark-oapi) — it surfaces menu_v6 +
+        # card.action.trigger events that lark-cli's `event consume` doesn't
+        # register. We ignore event_key (the WS subscribes to all 3 event
+        # types) and let the inbound pipeline dispatch by event["type"].
+        if self._ws_app_id and self._ws_app_secret:
+            from feishu_bot_codex.daemon.feishu_ws import WSEventConsumer
+            if self._ws_consumer is None:
+                self._ws_consumer = WSEventConsumer(
+                    app_id=self._ws_app_id,
+                    app_secret=self._ws_app_secret,
+                    domain=self._ws_domain,
+                )
+                await self._ws_consumer.start()
+            emitted = 0
+            async for event in self._ws_consumer.iter_events():
+                yield event
+                emitted += 1
+                if max_events and emitted >= max_events:
+                    return
+            return
+
+        # Fallback: lark-cli subprocess (legacy; misses menu / card events)
         args = [
             "event", "consume", event_key,
             *self._common_args(),

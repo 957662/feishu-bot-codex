@@ -188,6 +188,132 @@ def group_into_turns(events: Iterable[JsonlEvent]) -> list[Turn]:
 from feishu_bot_codex.rendering.card import build_card, build_header, build_image, build_markdown, build_note
 from feishu_bot_codex.rendering.tools import render_tool_block
 
+# Mermaid fenced code block detector. Matches ``` or ~~~ fences with a
+# `mermaid` language tag (case-insensitive). Body captured lazily so
+# multiple blocks in one message are matched independently.
+_MERMAID_FENCE_RE = re.compile(
+    r"(?P<fence>```|~~~)[ \t]*mermaid[ \t]*\n(?P<code>.*?)\n[ \t]*(?P=fence)",
+    re.IGNORECASE | re.DOTALL,
+)
+# Marker substituted for the mermaid source in the rendered markdown. The
+# actual image element is inserted right after the markdown element holding
+# this placeholder.
+MERMAID_PLACEHOLDER = "[mermaid 图,见下方]"
+
+
+def extract_mermaid_blocks(text: str) -> list[str]:
+    """Return source code of every ```mermaid``` block in `text`, in order.
+
+    De-duplicated by content so a turn repeating the same diagram doesn't
+    trigger two uploads.
+    """
+    if not text or "mermaid" not in text.lower():
+        return []
+    seen: dict[str, None] = {}
+    for m in _MERMAID_FENCE_RE.finditer(text):
+        code = m.group("code").strip()
+        if code:
+            seen.setdefault(code, None)
+    return list(seen.keys())
+
+
+def _split_text_by_mermaid(text: str) -> list[tuple[str, str]]:
+    """Split text into segments around mermaid fences.
+
+    Returns a list of (kind, value) where kind ∈ {"text", "mermaid"}.
+    """
+    if not text or "mermaid" not in text.lower():
+        return [("text", text)]
+    out: list[tuple[str, str]] = []
+    pos = 0
+    for m in _MERMAID_FENCE_RE.finditer(text):
+        if m.start() > pos:
+            out.append(("text", text[pos:m.start()]))
+        code = m.group("code").strip()
+        out.append(("mermaid", code))
+        pos = m.end()
+    if pos < len(text):
+        out.append(("text", text[pos:]))
+    return out
+
+
+# Mermaid fenced code block detector. Matches ``` or ~~~ fences with a
+# `mermaid` language tag (case-insensitive). The body is captured lazily so
+# multiple blocks in one message are matched independently.
+_MERMAID_FENCE_RE = re.compile(
+    r"(?P<fence>```|~~~)[ \t]*mermaid[ \t]*\n(?P<code>.*?)\n[ \t]*(?P=fence)",
+    re.IGNORECASE | re.DOTALL,
+)
+# Marker we substitute for the mermaid source in the rendered markdown text.
+# The actual diagram image is appended as a separate img element immediately
+# after the markdown element holding this placeholder.
+MERMAID_PLACEHOLDER = "[mermaid 图,见下方]"
+
+
+def extract_mermaid_blocks(text: str) -> list[str]:
+    """Return the source code of every ```mermaid``` block in `text`, in order.
+
+    Used by the outbound pipeline to know what to render + upload BEFORE
+    calling render_turn_to_card. Blocks are de-duplicated by content so that
+    a turn repeating the same diagram doesn't trigger two uploads.
+    """
+    if not text or "mermaid" not in text.lower():
+        return []
+    seen: dict[str, None] = {}
+    for m in _MERMAID_FENCE_RE.finditer(text):
+        code = m.group("code").strip()
+        if code:
+            seen.setdefault(code, None)
+    return list(seen.keys())
+
+
+def collect_mermaid_blocks(turn: Turn) -> list[str]:
+    """All mermaid source blocks referenced anywhere in this turn's text parts.
+
+    Tool_result content is included too — sometimes the model echoes a
+    diagram via a tool output (e.g. `cat diagram.mmd`).
+    """
+    seen: dict[str, None] = {}
+    for event in turn.assistant_events:
+        for part in event.content:
+            ptype = part.get("type")
+            if ptype == "text" and isinstance(part.get("text"), str):
+                for code in extract_mermaid_blocks(part["text"]):
+                    seen.setdefault(code, None)
+            elif ptype == "tool_result":
+                content = part.get("content", "")
+                if isinstance(content, list):
+                    content = "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
+                if isinstance(content, str):
+                    for code in extract_mermaid_blocks(content):
+                        seen.setdefault(code, None)
+    return list(seen.keys())
+
+
+def _split_text_by_mermaid(text: str) -> list[tuple[str, str]]:
+    """Split text into a sequence of segments around mermaid fences.
+
+    Yields a list of (kind, value) where kind ∈ {"text", "mermaid"}:
+      - "text"    → markdown chunk (may be empty if mermaid blocks are adjacent)
+      - "mermaid" → the source code of one fenced block, stripped
+
+    The original document is reconstructible by concatenating the text values
+    with the fenced blocks re-inserted at the mermaid slots.
+    """
+    if not text or "mermaid" not in text.lower():
+        return [("text", text)]
+    out: list[tuple[str, str]] = []
+    pos = 0
+    for m in _MERMAID_FENCE_RE.finditer(text):
+        if m.start() > pos:
+            out.append(("text", text[pos:m.start()]))
+        code = m.group("code").strip()
+        out.append(("mermaid", code))
+        pos = m.end()
+    if pos < len(text):
+        out.append(("text", text[pos:]))
+    return out
+
 # Feishu card limits (see tools.py): cap individual markdown elements and
 # total element count to stay under the per-message budget (~30KB / ~50 elements).
 MARKDOWN_CHAR_LIMIT = 4000
@@ -263,6 +389,29 @@ def collect_image_paths(turn: Turn) -> list[str]:
     return list(seen.keys())
 
 
+def collect_mermaid_blocks(turn: Turn) -> list[str]:
+    """All mermaid source blocks referenced anywhere in this turn's text parts.
+
+    Tool_result content is included too — sometimes the model echoes a
+    diagram via a tool output (e.g. `cat diagram.mmd`).
+    """
+    seen: dict[str, None] = {}
+    for event in turn.assistant_events:
+        for part in event.content:
+            ptype = part.get("type")
+            if ptype == "text" and isinstance(part.get("text"), str):
+                for code in extract_mermaid_blocks(part["text"]):
+                    seen.setdefault(code, None)
+            elif ptype == "tool_result":
+                content = part.get("content", "")
+                if isinstance(content, list):
+                    content = "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
+                if isinstance(content, str):
+                    for code in extract_mermaid_blocks(content):
+                        seen.setdefault(code, None)
+    return list(seen.keys())
+
+
 def _append_inline_images(elements, text, image_keys):
     if not image_keys:
         return
@@ -275,25 +424,62 @@ def _append_inline_images(elements, text, image_keys):
         if path in image_keys:
             elements.append(build_image(image_keys[path], alt=os.path.basename(path)))
 
+
+def _append_text_with_mermaid(
+    elements: list[dict],
+    text: str,
+    image_keys: dict[str, str],
+    mermaid_keys: dict[str, str],
+) -> None:
+    """Append a text part as one or more markdown + img elements.
+
+    Splits on ```mermaid``` fences. Mermaid blocks with a key get a
+    placeholder + img element; blocks without a key keep their raw fence
+    so the user can still copy the source.
+    """
+    segments = _split_text_by_mermaid(text)
+    for kind, value in segments:
+        if kind == "text":
+            if not value:
+                continue
+            chunk = _truncate(value, MARKDOWN_CHAR_LIMIT)
+            elements.append(build_markdown(chunk))
+            _append_inline_images(elements, value, image_keys)
+        else:  # "mermaid"
+            key = mermaid_keys.get(value)
+            if key:
+                elements.append(build_markdown(MERMAID_PLACEHOLDER))
+                elements.append(build_image(key, alt="mermaid diagram"))
+            else:
+                fallback = f"```mermaid\n{value}\n```"
+                elements.append(build_markdown(_truncate(fallback, MARKDOWN_CHAR_LIMIT)))
+
+
 def render_turn_to_card(
     turn: Turn,
     project_name: str = "project",
     render_style: str = "rich",
     image_keys: dict[str, str] | None = None,
+    mermaid_keys: dict[str, str] | None = None,
     in_progress: bool = False,
 ) -> dict:
     """Render a Turn to a Feishu interactive card JSON.
+
+    `mermaid_keys` maps mermaid source code (whitespace-stripped) → uploaded
+    image_key. Blocks WITH a key are replaced by "[mermaid 图,见下方]" +
+    img element. Blocks WITHOUT a key (render failed) keep their original
+    fenced source so the user still sees the diagram.
 
     `in_progress=True` appends a pacer "思考中…" line so the card visibly
     differs across updates while the model is mid-turn.
     """
     image_keys = image_keys or {}
+    mermaid_keys = mermaid_keys or {}
     elements: list[dict] = []
     for event in turn.assistant_events:
         for part in event.content:
             if part.get("type") == "text" and part.get("text"):
-                elements.append(build_markdown(_truncate(part["text"], MARKDOWN_CHAR_LIMIT)))
-                _append_inline_images(elements, part["text"], image_keys)
+                _append_text_with_mermaid(elements, part["text"], image_keys, mermaid_keys)
             elif part.get("type") == "image":
                 src = part.get("source") or {}
                 if src.get("type") == "path" and src.get("path") in image_keys:

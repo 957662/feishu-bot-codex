@@ -9,11 +9,13 @@ from pathlib import Path
 from feishu_bot_codex.daemon.feishu import LarkCli
 from feishu_bot_codex.daemon.ratelimit import TokenBucket
 from feishu_bot_codex.daemon.state import BindingRuntimeState
+from feishu_bot_codex.rendering.mermaid import default_cache_dir, render_mermaid_to_png
 from feishu_bot_codex.rendering.turn import (
     JsonlEvent,
     Turn,
     collect_file_paths,
     collect_image_paths,
+    collect_mermaid_blocks,
     render_turn_to_card,
 )
 
@@ -55,6 +57,15 @@ class OutboundPipeline:
         # Without this, every flush during a long turn would re-send the
         # same file 20× because the path stays in the jsonl tool_result.
         self._sent_file_paths: set[str] = set()
+        # Mermaid render + upload cache:
+        #   _mermaid_image_key_cache: source code → uploaded Feishu image_key
+        #   _mermaid_failed_codes:    source code we already failed to render
+        #                             (don't keep spawning mmdc / hitting ink)
+        # The on-disk png cache (rendering/mermaid.py) survives daemon restart;
+        # this in-memory dict avoids re-uploading after each restart too — the
+        # Feishu image_key never expires for our purposes.
+        self._mermaid_image_key_cache: dict[str, str] = {}
+        self._mermaid_failed_codes: set[str] = set()
 
     async def process_backlog(self) -> None:
         """Read new bytes from jsonl past current offset; render any new turns.
@@ -131,12 +142,17 @@ class OutboundPipeline:
 
         # Upload any images referenced in this turn so the card can embed them.
         image_keys = await self._upload_turn_images(self._current_turn)
+        # Render + upload any ```mermaid``` code blocks → image_keys keyed by
+        # the diagram source. Render failures (mmdc + mermaid.ink both down)
+        # leave the source untouched so the user still sees the raw fence.
+        mermaid_keys = await self._render_and_upload_mermaid(self._current_turn)
 
         card = render_turn_to_card(
             self._current_turn,
             project_name=self._project_name,
             render_style=self._render_style,
             image_keys=image_keys,
+            mermaid_keys=mermaid_keys,
             in_progress=in_progress,
         )
         if not card.get("body", {}).get("elements"):
@@ -195,6 +211,41 @@ class OutboundPipeline:
             except Exception as e:
                 logger.warning("send_file failed for %s: %s", path, e)
                 self._sent_file_paths.add(path)
+
+    async def _render_and_upload_mermaid(self, turn: Turn) -> dict[str, str]:
+        """For every ```mermaid``` block in this turn, render it to PNG and
+        upload to Feishu. Returns code → image_key. Both renders and uploads
+        are cached so repeated flushes of the same in-progress turn don't
+        re-render or re-upload.
+        """
+        codes = collect_mermaid_blocks(turn)
+        if not codes:
+            return {}
+        result: dict[str, str] = {}
+        cache_dir = default_cache_dir()
+        for code in codes:
+            if code in self._mermaid_image_key_cache:
+                result[code] = self._mermaid_image_key_cache[code]
+                continue
+            if code in self._mermaid_failed_codes:
+                continue
+            # Render to PNG (in-process; uses on-disk cache by content hash).
+            png_path = render_mermaid_to_png(code, cache_dir)
+            if png_path is None:
+                self._mermaid_failed_codes.add(code)
+                continue
+            await self._bucket.acquire()
+            try:
+                key = await self._lark.upload_image(str(png_path))
+                self._mermaid_image_key_cache[code] = key
+                result[code] = key
+            except Exception as e:
+                logger.warning(
+                    "mermaid upload_image failed for %s…: %s (caching as failed)",
+                    code[:40].replace("\n", " "), e,
+                )
+                self._mermaid_failed_codes.add(code)
+        return result
 
     async def _upload_turn_images(self, turn: Turn) -> dict[str, str]:
         """Upload all local image files referenced in `turn`. Returns path → image_key.

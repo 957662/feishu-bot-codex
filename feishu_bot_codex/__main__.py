@@ -20,15 +20,15 @@ _DEFAULT_DATA_DIR = Path.home() / ".feishu-bot-codex"
 
 async def _run_daemon() -> None:
     socket_path = Path(os.environ.get(
-        "FEISHU_BOT_CLAUDE_SOCKET",
+        "FEISHU_BOT_CODEX_SOCKET",
         _DEFAULT_DATA_DIR / "control.sock",
     ))
     bindings_path = Path(os.environ.get(
-        "FEISHU_BOT_CLAUDE_BINDINGS",
+        "FEISHU_BOT_CODEX_BINDINGS",
         _DEFAULT_DATA_DIR / "bindings.toml",
     ))
     data_dir = Path(os.environ.get(
-        "FEISHU_BOT_CLAUDE_DATA_DIR",
+        "FEISHU_BOT_CODEX_DATA_DIR",
         _DEFAULT_DATA_DIR,
     ))
 
@@ -39,21 +39,29 @@ async def _run_daemon() -> None:
     from feishu_bot_codex.config.keychain import MacOSKeychainStore
 
     store = BindingStore(bindings_path)
+    keychain = MacOSKeychainStore()
+
+    def _lark_for_binding(cfg) -> RealLarkCli:
+        """Build a RealLarkCli that owns its WS event source per binding.
+
+        The WS client subscribes to message + menu + card.action events for
+        this specific app, replacing the lark-cli `event consume` subprocess
+        which is dead code for menu/card events.
+        """
+        secret = keychain.get(cfg.secret_ref) if cfg.secret_ref else None
+        return RealLarkCli(
+            ws_app_id=cfg.feishu_app_id,
+            ws_app_secret=secret,
+            ws_domain=cfg.domain or "https://open.feishu.cn",
+        )
+
     orchestrator = Orchestrator(
         store=store,
         tmux_factory=lambda name: RealTmux(),
-        # Use the binding name as the lark-cli profile, so each binding talks
-        # to its OWN Feishu app's event stream. Without --profile, lark-cli
-        # uses its global default — which may be the WRONG app (e.g. another
-        # binding's profile), silently swallowing all inbound events.
-        lark_factory=lambda cfg: RealLarkCli(profile=cfg.name),
+        lark_factory=_lark_for_binding,
         data_dir=data_dir,
     )
 
-    keychain = MacOSKeychainStore()
-    # The "bare" RealLarkCli used for unscoped operations (auth bot-new,
-    # menu push) doesn't pin a profile — those calls happen during binding
-    # creation, before a per-binding profile is fully set up.
     real_lark = RealLarkCli()
 
     server = await serve(

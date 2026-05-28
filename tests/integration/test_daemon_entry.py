@@ -19,8 +19,8 @@ async def test_daemon_subprocess_responds_to_cli(tmp_path):
     bindings_path = tmp_path / "bindings.toml"
 
     env = os.environ.copy()
-    env["FEISHU_BOT_CLAUDE_SOCKET"] = str(socket_path)
-    env["FEISHU_BOT_CLAUDE_BINDINGS"] = str(bindings_path)
+    env["FEISHU_BOT_CODEX_SOCKET"] = str(socket_path)
+    env["FEISHU_BOT_CODEX_BINDINGS"] = str(bindings_path)
 
     daemon = subprocess.Popen(
         [sys.executable, "-m", "feishu_bot_codex", "daemon"],
@@ -63,8 +63,8 @@ async def test_daemon_list_empty(tmp_path):
     bindings_path = tmp_path / "bindings.toml"
 
     env = os.environ.copy()
-    env["FEISHU_BOT_CLAUDE_SOCKET"] = str(socket_path)
-    env["FEISHU_BOT_CLAUDE_BINDINGS"] = str(bindings_path)
+    env["FEISHU_BOT_CODEX_SOCKET"] = str(socket_path)
+    env["FEISHU_BOT_CODEX_BINDINGS"] = str(bindings_path)
 
     daemon = subprocess.Popen(
         [sys.executable, "-m", "feishu_bot_codex", "daemon"],
