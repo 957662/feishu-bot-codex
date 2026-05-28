@@ -37,7 +37,12 @@ confirm() {
         echo "[auto-yes] $msg"
         return 0
     fi
-    # /dev/tty so we still read input even when stdout is piped
+    # Non-interactive shell (CI, docker, curl|bash) → no tty to prompt on;
+    # auto-confirm so the script doesn't hang waiting for input on a closed fd.
+    if [ ! -t 0 ] || [ ! -r /dev/tty ]; then
+        echo "[no-tty, auto-yes] $msg"
+        return 0
+    fi
     read -rp "$msg [Y/n] " ans </dev/tty || ans="y"
     case "${ans:-y}" in
         n|N|no|No|NO) return 1 ;;

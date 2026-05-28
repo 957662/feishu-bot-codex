@@ -106,7 +106,11 @@ class OutboundPipeline:
             if idle > SETTLE_AFTER_SECONDS:
                 await self._flush_current_turn(in_progress=False)
                 self._final_flushed_at_offset = self._state.jsonl_offset
-            elif now - self._last_anim_flushed_at > 0.030:
+            elif now - self._last_anim_flushed_at > 0.1:
+                # 10 fps animation: Feishu cards don't visually update faster
+                # than ~10 Hz anyway, and this keeps us at ≤10 update_card
+                # QPS per binding — well clear of the 50/s tenant cap even
+                # with 2-3 active bindings competing on the same TokenBucket.
                 await self._flush_current_turn(in_progress=True)
                 self._last_anim_flushed_at = now
             return
@@ -180,7 +184,13 @@ class OutboundPipeline:
         # Render + upload any ```mermaid``` code blocks → image_keys keyed by
         # the diagram source. Render failures (mmdc + mermaid.ink both down)
         # leave the source untouched so the user still sees the raw fence.
-        mermaid_keys = await self._render_and_upload_mermaid(self._current_turn)
+        # Skip during in-progress flushes — mmdc fires puppeteer (15s timeout)
+        # which would block the event loop on every spinner tick. Defer to the
+        # final flush so it only runs once per turn.
+        if in_progress:
+            mermaid_keys: dict[str, str] = {}
+        else:
+            mermaid_keys = await self._render_and_upload_mermaid(self._current_turn)
 
         card = render_turn_to_card(
             self._current_turn,

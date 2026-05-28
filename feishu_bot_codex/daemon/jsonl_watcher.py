@@ -18,9 +18,11 @@ import watchfiles
 
 logger = logging.getLogger(__name__)
 
-# How often to poll file size as a safety net. 1 second gives a typewriter-like
-# refresh during active turn (one update_card per second well under Feishu's
-# 50/s rate limit).
+# Poll cadence during an active turn — 30 Hz so the spinner advances smoothly.
+# Outbound throttles the actual update_card call to ≤10 QPS per binding
+# (_last_anim_flushed_at > 0.1), which keeps us well under Feishu's 50/s tenant
+# cap even with multiple bindings live. Outside the active window the poller
+# falls silent (see in_active_window check below).
 POLL_INTERVAL_SECONDS = 0.033
 
 # After this much idle time (no file growth), emit ONE more change so outbound

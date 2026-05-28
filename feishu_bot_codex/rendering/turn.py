@@ -510,7 +510,9 @@ def render_turn_to_card(
 
     if in_progress:
         import time
-        spinner = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"][int(time.time() * 20) % 8]
+        # Braille spinner — uniform 7-dot frames, 2.5 cycles/s. monotonic so
+        # an NTP step doesn't make the animation jump backwards.
+        spinner = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"][int(time.monotonic() * 20) % 8]
         started = None
         for e in turn.assistant_events:
             ts = e.raw.get("timestamp")

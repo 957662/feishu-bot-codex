@@ -198,13 +198,14 @@ def config(ctx, cwd, kv):
     sys.exit(_print_events_sync(ctx.obj["socket"], "config", {"cwd": str(cwd), "kv": list(kv)}))
 
 
-def _resolve_tmux_session(socket_path: Path, cwd: Path) -> str:
+def _resolve_tmux_session(socket_path: Path, cwd: Path, agent: str = "codex") -> str:
     """Ask daemon for the tmux_session name bound to `cwd`.
 
-    Falls back to `codex-<basename(cwd)>` if no binding exists or daemon
-    is unreachable — keeps `shell` usable in pre-bind exploration.
+    Falls back to `<agent>-<basename(cwd)>` if no binding exists or daemon
+    is unreachable — keeps `shell` usable in pre-bind exploration and makes
+    `--agent claude` give you `claude-foo` rather than `codex-foo`.
     """
-    fallback = f"codex-{cwd.name}"
+    fallback = f"{agent}-{cwd.name}"
     cwd_resolved = str(cwd.resolve())
 
     async def _ask():
@@ -246,7 +247,7 @@ def shell(ctx, cwd, agent, extra_args):
     """
     target = cwd or Path(os.getcwd())
     target = target.resolve()
-    session_name = _resolve_tmux_session(ctx.obj["socket"], target)
+    session_name = _resolve_tmux_session(ctx.obj["socket"], target, agent)
 
     pkg_dir = Path(__file__).resolve().parent
     candidates = [
