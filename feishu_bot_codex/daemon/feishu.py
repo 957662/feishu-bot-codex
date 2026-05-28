@@ -51,7 +51,20 @@ class LarkCli(ABC):
 
     @abstractmethod
     async def upload_image(self, path: str) -> str:
-        """Upload a local image file to Feishu IM. Returns image_key."""
+        """Upload a local image file to Feishu IM. Returns the `image_key`
+        (img_xxx) usable in cards / messages.
+        """
+
+    @abstractmethod
+    async def upload_file(self, path: str, file_type: str = "stream") -> str:
+        """Upload a non-image file to Feishu IM. Returns `file_key` (file_xxx).
+        `file_type` is one of pdf/doc/xls/ppt/mp4/opus/stream; "stream" is
+        the generic fallback.
+        """
+
+    @abstractmethod
+    async def send_file(self, chat_id: str, file_key: str, file_name: str = "") -> str:
+        """Send a standalone file message into a chat. Returns the message_id."""
 
     @abstractmethod
     def consume_events(self, event_key: str, max_events: int = 0) -> AsyncIterator[dict]:
@@ -164,6 +177,16 @@ class FakeLarkCli(LarkCli):
         self.send_calls.append({"kind": "upload", "path": path, "image_key": key})
         return key
 
+    async def upload_file(self, path: str, file_type: str = "stream") -> str:
+        self._counter += 1
+        key = f"file_fake_{self._counter}"
+        self.send_calls.append({"kind": "upload_file", "path": path, "file_type": file_type, "file_key": key})
+        return key
+
+    async def send_file(self, chat_id: str, file_key: str, file_name: str = "") -> str:
+        self.send_calls.append({"kind": "send_file", "chat_id": chat_id, "file_key": file_key, "file_name": file_name})
+        return self._next_message_id()
+
     async def consume_events(self, event_key: str, max_events: int = 0) -> AsyncIterator[dict]:
         emitted = 0
         while True:
@@ -193,17 +216,10 @@ class RealLarkCli(LarkCli):
     runs a fresh subprocess.
     """
 
-    def __init__(
-        self,
-        binary: str = "lark-cli",
-        as_bot: bool = True,
-        extra_env: dict[str, str] | None = None,
-        profile: str | None = None,
-    ) -> None:
+    def __init__(self, binary: str = "lark-cli", as_bot: bool = True, extra_env: dict[str, str] | None = None) -> None:
         self._binary = binary
         self._as_bot = as_bot
         self._extra_env = dict(extra_env or {})
-        self._profile = profile
 
     async def _run_raw(self, args: list[str], timeout: float = 30.0) -> tuple[str, int]:
         """Run `lark-cli <args>`. Return (combined stdout+stderr, returncode).
@@ -233,20 +249,7 @@ class RealLarkCli(LarkCli):
         return combined, proc.returncode
 
     def _common_args(self) -> list[str]:
-        """Args injected into every lark-cli invocation.
-
-        --profile <name> is critical when multiple lark-cli profiles exist on
-        the same machine (e.g. running both feishu-bot-claude and
-        feishu-bot-codex side by side, each with its own Feishu app). Without
-        it, lark-cli picks the global default — which may be the WRONG
-        profile, silently routing events to a different daemon's inbound.
-        """
-        args: list[str] = []
-        if self._profile:
-            args += ["--profile", self._profile]
-        if self._as_bot:
-            args += ["--as", "bot"]
-        return args
+        return ["--as", "bot"] if self._as_bot else []
 
     def _extract_message_id(self, out: str) -> str:
         """lark-cli emits a (possibly pretty-printed) JSON object on stdout.
@@ -384,7 +387,11 @@ class RealLarkCli(LarkCli):
         return out_path
 
     async def upload_image(self, path: str) -> str:
-        """Upload an image to Feishu IM. Returns image_key (img_xxx)."""
+        """Upload an image to Feishu IM. Returns `image_key` (img_xxx).
+
+        Wraps `lark-cli im images create --file image=<path> --data
+        '{"image_type":"message"}'`. The response JSON contains the image_key.
+        """
         import os
         if not os.path.exists(path):
             raise RuntimeError(f"upload_image: file not found: {path}")
@@ -397,6 +404,70 @@ class RealLarkCli(LarkCli):
         out, code = await self._run_raw(args, timeout=60.0)
         if code != 0:
             raise RuntimeError(f"lark-cli upload_image failed (exit {code}): {out!r}")
+        # Parse response — image_key is under data.image_key
+        try:
+            payload = json.loads(out.strip())
+        except json.JSONDecodeError:
+            # try line-by-line
+            payload = None
+            for line in reversed(out.strip().splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        payload = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+        if not payload:
+            raise RuntimeError(f"upload_image: cannot parse output: {out!r}")
+        key = None
+        for path_keys in (("image_key",), ("data", "image_key")):
+            node = payload
+            ok = True
+            for k in path_keys:
+                if isinstance(node, dict) and k in node:
+                    node = node[k]
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(node, str) and node:
+                key = node
+                break
+        if not key:
+            raise RuntimeError(f"upload_image: image_key missing in response: {payload!r}")
+        return key
+
+    _FILE_TYPE_BY_EXT = {
+        ".pdf": "pdf", ".doc": "doc", ".docx": "doc",
+        ".xls": "xls", ".xlsx": "xls",
+        ".ppt": "ppt", ".pptx": "ppt",
+        ".mp4": "mp4", ".mov": "mp4",
+        ".opus": "opus",
+    }
+
+    @classmethod
+    def _guess_file_type(cls, path: str) -> str:
+        import os
+        ext = os.path.splitext(path)[1].lower()
+        return cls._FILE_TYPE_BY_EXT.get(ext, "stream")
+
+    async def upload_file(self, path: str, file_type: str = "") -> str:
+        """Upload a non-image file via raw Feishu /open-apis/im/v1/files."""
+        import os
+        if not os.path.exists(path):
+            raise RuntimeError(f"upload_file: file not found: {path}")
+        ft = file_type or self._guess_file_type(path)
+        body = {"file_type": ft, "file_name": os.path.basename(path)}
+        args = [
+            "api", "POST", "/open-apis/im/v1/files",
+            *self._common_args(),
+            "--file", f"file={path}",
+            "--data", json.dumps(body, ensure_ascii=False),
+        ]
+        out, code = await self._run_raw(args, timeout=120.0)
+        if code != 0:
+            raise RuntimeError(f"lark-cli upload_file failed (exit {code}): {out!r}")
+        # Response is wrapped: {"ok":true, "data":{"file_key":"file_xxx"}}
         try:
             payload = json.loads(out.strip())
         except json.JSONDecodeError:
@@ -409,20 +480,35 @@ class RealLarkCli(LarkCli):
                     except json.JSONDecodeError:
                         continue
         if not payload:
-            raise RuntimeError(f"upload_image: cannot parse output: {out!r}")
-        key = None
-        for path_keys in (("image_key",), ("data", "image_key")):
-            node = payload; ok = True
-            for k in path_keys:
+            raise RuntimeError(f"upload_file: cannot parse output: {out!r}")
+        for keys in (("file_key",), ("data", "file_key")):
+            node = payload
+            ok = True
+            for k in keys:
                 if isinstance(node, dict) and k in node:
                     node = node[k]
                 else:
                     ok = False; break
             if ok and isinstance(node, str) and node:
-                key = node; break
-        if not key:
-            raise RuntimeError(f"upload_image: image_key missing in response: {payload!r}")
-        return key
+                return node
+        raise RuntimeError(f"upload_file: file_key missing in response: {payload!r}")
+
+    async def send_file(self, chat_id: str, file_key: str, file_name: str = "") -> str:
+        """Send a standalone file message (not a card element) to a chat."""
+        content = {"file_key": file_key}
+        if file_name:
+            content["file_name"] = file_name
+        args = [
+            "im", "+messages-send",
+            *self._common_args(),
+            "--chat-id", chat_id,
+            "--msg-type", "file",
+            "--content", json.dumps(content, ensure_ascii=False),
+        ]
+        out, code = await self._run_raw(args, timeout=30.0)
+        if code != 0:
+            raise RuntimeError(f"lark-cli send_file failed (exit {code}): {out!r}")
+        return self._extract_message_id(out)
 
     async def consume_events(self, event_key: str, max_events: int = 0) -> AsyncIterator[dict]:
         args = [

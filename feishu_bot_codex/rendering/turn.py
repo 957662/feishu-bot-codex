@@ -207,6 +207,38 @@ _IMAGE_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Non-image file extensions we'll auto-upload as standalone Feishu messages.
+_FILE_PATH_RE = re.compile(
+    r"(?<![\w./])"
+    r"(?P<path>(?:/[\w./\-]+|[A-Za-z]:\\[\w.\\\- ]+)\."
+    r"(?:pdf|txt|md|markdown|csv|tsv|json|yaml|yml|toml|xml|"
+    r"py|js|ts|tsx|jsx|go|rs|java|kt|swift|c|h|cpp|hpp|cs|rb|php|"
+    r"sh|bash|zsh|fish|sql|html|css|scss|log|conf|ini|cfg|"
+    r"docx?|xlsx?|pptx?))"
+    r"(?![\w])",
+    re.IGNORECASE,
+)
+
+
+def collect_file_paths(turn: Turn) -> list[str]:
+    seen: dict[str, None] = {}
+    for event in turn.assistant_events:
+        for part in event.content:
+            ptype = part.get("type")
+            if ptype == "text" and isinstance(part.get("text"), str):
+                for m in _FILE_PATH_RE.finditer(part["text"]):
+                    seen.setdefault(m.group("path"), None)
+            elif ptype == "tool_result":
+                content = part.get("content", "")
+                if isinstance(content, list):
+                    content = "".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
+                if isinstance(content, str):
+                    for m in _FILE_PATH_RE.finditer(content):
+                        seen.setdefault(m.group("path"), None)
+    return list(seen.keys())
+
+
+
 
 def collect_image_paths(turn: Turn) -> list[str]:
     """Scan a Turn for local image file paths to upload + show."""

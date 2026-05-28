@@ -76,6 +76,9 @@ class InboundPipeline:
         bootstrap_complete: bool = False,
         status_card_builder=None,
         help_card_builder=None,
+        slash_card_builder=None,
+        bindings_card_builder=None,
+        find_card_builder=None,
         chat_id_provider=None,
     ) -> None:
         self._tmux_session = tmux_session
@@ -104,6 +107,10 @@ class InboundPipeline:
         # (so it picks up post-bootstrap state without re-binding).
         self._status_card_builder = status_card_builder
         self._help_card_builder = help_card_builder
+        self._slash_card_builder = slash_card_builder
+        self._bindings_card_builder = bindings_card_builder
+        # find_card_builder takes the keyword and returns a card dict
+        self._find_card_builder = find_card_builder
         self._chat_id_provider = chat_id_provider
 
     async def process_until_idle(self, max_events: int = 0) -> None:
@@ -242,13 +249,35 @@ class InboundPipeline:
         if not word:
             return False
 
-        # Status / help — sent BACK to the user as a card, not to the TUI.
+        # Status / help / slash / bindings / find — sent BACK as a card, not to the TUI.
         if word in ("status", "state", "状态", "现状"):
             await self._send_status_card(message_id)
             return True
         if word in ("help", "帮助", "?", "？"):
             await self._send_help_card(message_id)
             return True
+        if word in ("slash", "命令", "commands", "cmd"):
+            await self._send_slash_card(message_id)
+            return True
+        if word in ("list", "bindings", "projects", "项目"):
+            await self._send_bindings_card(message_id)
+            return True
+        # `!find <keyword>` / `!搜 <keyword>` — keep the rest of the message
+        # body as the search query (case-preserving).
+        for kw_prefix in ("find ", "搜 ", "search "):
+            if stripped[1:].lower().lstrip().startswith(kw_prefix):
+                # Extract the original-case query from `text`
+                # (use stripped[1:] to drop the `!`, then strip the prefix)
+                rest = stripped[1:].lstrip()
+                # remove the prefix word + any following whitespace
+                idx = rest.lower().find(kw_prefix)
+                if idx == 0:
+                    query = rest[len(kw_prefix):].strip()
+                else:
+                    query = rest.strip()
+                if query:
+                    await self._send_find_card(message_id, query)
+                    return True
 
         special = KEY_COMMANDS.get(word)
         if special is not None:
@@ -463,18 +492,42 @@ class InboundPipeline:
             logger.warning("send status card failed: %s", e)
 
     async def _send_help_card(self, message_id: str) -> None:
-        if self._help_card_builder is None or self._chat_id_provider is None:
+        await self._send_meta_card(message_id, self._help_card_builder, "help")
+
+    async def _send_slash_card(self, message_id: str) -> None:
+        await self._send_meta_card(message_id, self._slash_card_builder, "slash")
+
+    async def _send_bindings_card(self, message_id: str) -> None:
+        await self._send_meta_card(message_id, self._bindings_card_builder, "bindings")
+
+    async def _send_find_card(self, message_id: str, query: str) -> None:
+        if self._find_card_builder is None or self._chat_id_provider is None:
             return
         chat_id = self._chat_id_provider()
         if not chat_id:
             return
         try:
-            card = self._help_card_builder()
+            card = self._find_card_builder(query)
             await self._lark.send_card(chat_id=chat_id, card=card)
             if message_id:
                 asyncio.create_task(self._react_quietly(message_id, "OK"))
         except Exception as e:
-            logger.warning("send help card failed: %s", e)
+            logger.warning("send find card failed: %s", e)
+
+    async def _send_meta_card(self, message_id: str, builder, name: str) -> None:
+        """Generic helper for builders that take no args and return a card dict."""
+        if builder is None or self._chat_id_provider is None:
+            return
+        chat_id = self._chat_id_provider()
+        if not chat_id:
+            return
+        try:
+            card = builder()
+            await self._lark.send_card(chat_id=chat_id, card=card)
+            if message_id:
+                asyncio.create_task(self._react_quietly(message_id, "OK"))
+        except Exception as e:
+            logger.warning("send %s card failed: %s", name, e)
 
     async def _handle_menu(self, event: dict) -> None:
         ev = event.get("event", {})

@@ -12,6 +12,7 @@ from feishu_bot_codex.daemon.state import BindingRuntimeState
 from feishu_bot_codex.rendering.turn import (
     JsonlEvent,
     Turn,
+    collect_file_paths,
     collect_image_paths,
     render_turn_to_card,
 )
@@ -50,6 +51,10 @@ class OutboundPipeline:
         #   or a path the model fabricated that doesn't actually exist).
         self._image_key_cache: dict[str, str] = {}
         self._failed_image_paths: set[str] = set()
+        # Files we've already pushed to the user as standalone messages.
+        # Without this, every flush during a long turn would re-send the
+        # same file 20× because the path stays in the jsonl tool_result.
+        self._sent_file_paths: set[str] = set()
 
     async def process_backlog(self) -> None:
         """Read new bytes from jsonl past current offset; render any new turns.
@@ -137,6 +142,59 @@ class OutboundPipeline:
         if not card.get("body", {}).get("elements"):
             return
         await self._send_or_update_with_card(card)
+        # Push any non-image files referenced in this turn as standalone
+        # Feishu file messages (cards can embed images but not files).
+        # Only fire when the turn has settled — avoids sending the file once
+        # per polling cycle while the model is still mid-tool.
+        if not in_progress:
+            await self._send_attached_files(self._current_turn)
+
+    async def _send_attached_files(self, turn: Turn) -> None:
+        """Find file paths referenced in this turn; upload + push each as a
+        standalone Feishu file message. Idempotent — paths already sent in
+        a prior flush are skipped.
+        """
+        import os
+        chat_id = self._effective_chat_id()
+        if not chat_id:
+            return
+        paths = collect_file_paths(turn)
+        for path in paths:
+            if path in self._sent_file_paths:
+                continue
+            if path in self._failed_image_paths:
+                # Treat the failed-image set as a shared blocklist for sandbox-
+                # restricted paths so we don't waste API calls.
+                continue
+            if not os.path.exists(path):
+                self._sent_file_paths.add(path)
+                continue
+            # Don't push huge files (Feishu limit 30MB; we cap at 25MB)
+            try:
+                if os.path.getsize(path) > 25 * 1024 * 1024:
+                    logger.info("skip large file >25MB: %s", path)
+                    self._sent_file_paths.add(path)
+                    continue
+            except OSError:
+                continue
+            await self._bucket.acquire()
+            try:
+                file_key = await self._lark.upload_file(path)
+            except Exception as e:
+                logger.warning("upload_file failed for %s: %s (skipping)", path, e)
+                self._sent_file_paths.add(path)
+                continue
+            await self._bucket.acquire()
+            try:
+                await self._lark.send_file(
+                    chat_id=chat_id,
+                    file_key=file_key,
+                    file_name=os.path.basename(path),
+                )
+                self._sent_file_paths.add(path)
+            except Exception as e:
+                logger.warning("send_file failed for %s: %s", path, e)
+                self._sent_file_paths.add(path)
 
     async def _upload_turn_images(self, turn: Turn) -> dict[str, str]:
         """Upload all local image files referenced in `turn`. Returns path → image_key.

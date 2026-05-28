@@ -107,9 +107,19 @@ class Orchestrator:
             DEFAULT_MENU_SPECIAL_MAP,
             DEFAULT_MENU_YESNO_MAP,
         )
-        from feishu_bot_codex.rendering.status import build_status_card, build_help_card
+        from feishu_bot_codex.rendering.status import (
+            build_status_card,
+            build_help_card,
+            build_slash_card,
+            build_bindings_card,
+            build_find_card,
+            search_jsonl,
+        )
 
-        # !status / !help callbacks — closures that capture binding context.
+        # Closures over binding context — captured at start_binding time.
+        # Note: state.chat_id reads the LIVE state object each call (because
+        # the closure captures the reference, not a snapshot), so post-bootstrap
+        # changes are picked up.
         def _status_card() -> dict:
             return build_status_card(
                 binding_name=cfg.name,
@@ -122,6 +132,36 @@ class Orchestrator:
             )
         def _help_card() -> dict:
             return build_help_card(binding_name=cfg.name)
+        def _slash_card() -> dict:
+            return build_slash_card(binding_name=cfg.name, command_map=DEFAULT_MENU_COMMAND_MAP)
+        def _bindings_card() -> dict:
+            # Read all bindings; for each, snapshot file mtime if jsonl exists
+            rows: list[dict] = []
+            for bc in self._store.all():
+                row = {
+                    "name": bc.name,
+                    "project_dir": bc.project_dir,
+                    "tmux_session": bc.tmux_session,
+                    "feishu_app_id": bc.feishu_app_id,
+                }
+                try:
+                    sp = self._data_dir / f"state-{bc.name}.json"
+                    if sp.exists():
+                        import json as _json
+                        row["chat_id"] = _json.loads(sp.read_text()).get("chat_id", "")
+                except Exception:
+                    pass
+                try:
+                    jp = self._guess_jsonl_path(bc)
+                    if jp.exists():
+                        row["mtime"] = jp.stat().st_mtime
+                except Exception:
+                    pass
+                rows.append(row)
+            return build_bindings_card(rows)
+        def _find_card(query: str) -> dict:
+            matches = search_jsonl(jsonl_path, query) if jsonl_path else []
+            return build_find_card(binding_name=cfg.name, keyword=query, matches=matches)
         def _current_chat_id() -> str:
             return state.chat_id
 
@@ -137,6 +177,9 @@ class Orchestrator:
             on_chat_id_discovered=_on_chat_discovered,
             status_card_builder=_status_card,
             help_card_builder=_help_card,
+            slash_card_builder=_slash_card,
+            bindings_card_builder=_bindings_card,
+            find_card_builder=_find_card,
             chat_id_provider=_current_chat_id,
             # If state already has chat_id (prior bootstrap), skip the
             # "consume first message" behavior on this restart.
