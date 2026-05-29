@@ -137,7 +137,11 @@ def render_mermaid_to_png(code: str, cache_dir: Path) -> Optional[Path]:
         return out_path
     if _try_mmdc(code, out_path):
         return out_path
-    if _try_ink(code, out_path):
+    # mermaid.ink is a PUBLIC third-party service — the diagram source (which
+    # may contain private paths/hostnames/architecture) is base64'd into the
+    # URL and sent over the network. Gate it so a privacy-sensitive user can
+    # opt out and keep the raw fence instead of leaking source.
+    if not os.environ.get("FEISHU_BOT_NO_MERMAID_INK") and _try_ink(code, out_path):
         return out_path
     # Both backends failed — clean up any zero-byte file mmdc may have left
     # so the next call doesn't think we have a cached success.

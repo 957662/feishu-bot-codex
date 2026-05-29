@@ -101,6 +101,10 @@ class InboundPipeline:
         # we don't double-forward the same user message to Claude.
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_event_ids_max = 1024
+        # Retain fire-and-forget reaction tasks: a bare asyncio.create_task is
+        # only weakly referenced by the loop, so it can be GC'd mid-flight and
+        # its exceptions are swallowed. Hold a strong ref until done.
+        self._bg_tasks: set[asyncio.Task] = set()
         # Optional callbacks for `!status` / `!help` self-reporting cards.
         # `status_card_builder()` returns a dict (the rendered card JSON).
         # `chat_id_provider()` returns the binding's chat_id at call time
@@ -189,7 +193,7 @@ class InboundPipeline:
         if message_type == "image":
             await self._handle_image(message_id, content_raw)
             if message_id:
-                asyncio.create_task(self._react_quietly(message_id, "LOVE"))
+                self._react_bg(message_id, "LOVE")
             return
 
         # ---- File messages (.pdf / .txt / .py / .md / etc.) ----
@@ -198,7 +202,7 @@ class InboundPipeline:
         if message_type == "file":
             await self._handle_file(message_id, content_raw)
             if message_id:
-                asyncio.create_task(self._react_quietly(message_id, "LOVE"))
+                self._react_bg(message_id, "LOVE")
             return
 
         if message_type != "text":
@@ -234,7 +238,7 @@ class InboundPipeline:
             text = text[: self._max_message_length] + "\n...[truncated]"
         # Ack the user's message with a reaction so they see Claude received it.
         if message_id:
-            asyncio.create_task(self._react_quietly(message_id, "LOVE"))
+            self._react_bg(message_id, "LOVE")
         # Inject the body. Multi-line text uses Alt+Enter as a soft newline
         # so the TUI sees each \n as "next line of input" instead of "submit
         # now"; the final Enter commits the whole thing.
@@ -284,7 +288,7 @@ class InboundPipeline:
             try:
                 self._tmux.send_special(session=self._tmux_session, key=special)
                 if message_id:
-                    asyncio.create_task(self._react_quietly(message_id, "OK"))
+                    self._react_bg(message_id, "OK")
                 logger.info("key command %r → %s", word, special)
             except Exception as e:
                 logger.warning("send_special %r failed: %s", special, e)
@@ -297,7 +301,7 @@ class InboundPipeline:
                 await asyncio.sleep(0.2)
                 self._tmux.send_special(session=self._tmux_session, key="Enter")
                 if message_id:
-                    asyncio.create_task(self._react_quietly(message_id, "OK"))
+                    self._react_bg(message_id, "OK")
                 logger.info("yes/no command %r → %r", word, yn)
             except Exception as e:
                 logger.warning("y/n %r failed: %s", word, e)
@@ -307,7 +311,7 @@ class InboundPipeline:
         # to normal text injection so we don't silently drop user input.
         logger.info("unknown key command %r — treating as literal text", word)
         if message_id:
-            asyncio.create_task(self._react_quietly(message_id, "QUESTION"))
+            self._react_bg(message_id, "QUESTION")
         return False
 
     async def _inject_multiline_text(self, text: str) -> None:
@@ -469,6 +473,13 @@ class InboundPipeline:
             logger.warning("file download failed (msg=%s key=%s): %s", message_id, file_key, e)
             return None
 
+    def _react_bg(self, message_id: str, emoji_type: str) -> None:
+        """Fire-and-forget reaction with the task held until done (see
+        self._bg_tasks) so it isn't GC'd mid-flight and its errors surface."""
+        task = asyncio.create_task(self._react_quietly(message_id, emoji_type))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
     async def _react_quietly(self, message_id: str, emoji_type: str) -> None:
         try:
             await self._lark.add_reaction(message_id, emoji_type)
@@ -487,7 +498,7 @@ class InboundPipeline:
             card = self._status_card_builder()
             await self._lark.send_card(chat_id=chat_id, card=card)
             if message_id:
-                asyncio.create_task(self._react_quietly(message_id, "OK"))
+                self._react_bg(message_id, "OK")
         except Exception as e:
             logger.warning("send status card failed: %s", e)
 
@@ -510,7 +521,7 @@ class InboundPipeline:
             card = self._find_card_builder(query)
             await self._lark.send_card(chat_id=chat_id, card=card)
             if message_id:
-                asyncio.create_task(self._react_quietly(message_id, "OK"))
+                self._react_bg(message_id, "OK")
         except Exception as e:
             logger.warning("send find card failed: %s", e)
 
@@ -525,7 +536,7 @@ class InboundPipeline:
             card = builder()
             await self._lark.send_card(chat_id=chat_id, card=card)
             if message_id:
-                asyncio.create_task(self._react_quietly(message_id, "OK"))
+                self._react_bg(message_id, "OK")
         except Exception as e:
             logger.warning("send %s card failed: %s", name, e)
 
