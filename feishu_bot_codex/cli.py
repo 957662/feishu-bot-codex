@@ -82,7 +82,7 @@ import sys
 import click
 
 DEFAULT_SOCKET = Path(os.environ.get(
-    "FEISHU_BOT_CLAUDE_SOCKET",
+    "FEISHU_BOT_CODEX_SOCKET",
     Path.home() / ".feishu-bot-codex" / "control.sock",
 ))
 
@@ -95,7 +95,7 @@ def _open_url_in_browser(url: str) -> bool:
     """
     if not url or not url.startswith("http"):
         return False
-    if os.environ.get("FEISHU_BOT_CLAUDE_NO_AUTO_OPEN"):
+    if os.environ.get("FEISHU_BOT_CODEX_NO_AUTO_OPEN"):
         return False
     opener = "open" if sys.platform == "darwin" else "xdg-open"
     try:

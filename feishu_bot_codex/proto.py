@@ -19,8 +19,11 @@ class Request:
     @classmethod
     def from_json_line(cls, line: str) -> Request:
         data = json.loads(line)
+        # .get not [] — a missing "op" must surface as a clean ValueError from
+        # validate() (caught as "bad request"), not a KeyError that escapes the
+        # parse try-block and crashes the handler.
         return cls(
-            op=data["op"],
+            op=data.get("op", ""),
             args=data.get("args", {}),
             request_id=data.get("request_id", ""),
         )

@@ -6,7 +6,7 @@ import fcntl
 import os
 import tomllib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -242,4 +242,8 @@ def _binding_to_dict(b: BindingConfig) -> dict:
 
 
 def _dict_to_binding(d: dict) -> BindingConfig:
-    return BindingConfig(**d)
+    # Filter to known dataclass fields so a stale/hand-edited key in
+    # bindings.toml (e.g. a field removed in a later version) doesn't raise
+    # TypeError and take down the whole daemon at load time.
+    known = {f.name for f in fields(BindingConfig)}
+    return BindingConfig(**{k: v for k, v in d.items() if k in known})

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -18,6 +19,17 @@ from feishu_bot_codex.daemon.state import BindingRuntimeState
 from feishu_bot_codex.daemon.tmux import Tmux
 
 logger = logging.getLogger(__name__)
+
+
+def _same_path(a: str, b: str) -> bool:
+    """True if two paths point at the same location after normalization
+    (resolve symlinks/.., normalize case on case-insensitive filesystems)."""
+    try:
+        pa = os.path.normcase(str(Path(a).resolve()))
+        pb = os.path.normcase(str(Path(b).resolve()))
+        return pa == pb
+    except Exception:
+        return a == b
 
 
 @dataclass
@@ -303,7 +315,12 @@ class Orchestrator:
                     meta = json.loads(first)
                     if meta.get("type") != "session_meta":
                         continue
-                    if meta.get("payload", {}).get("cwd") == cfg.project_dir:
+                    sess_cwd = meta.get("payload", {}).get("cwd")
+                    # Normalize both sides: a session_meta.cwd with a trailing
+                    # slash / symlink / (on Windows) drive-case difference must
+                    # still match the bound project_dir, else we silently fall
+                    # through to the claude backend / no-session.
+                    if sess_cwd and _same_path(sess_cwd, cfg.project_dir):
                         codex_candidates.append(path)
                 except Exception:
                     continue

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch a tmux session named claude-<basename(cwd)> with the chosen
+# Launch a tmux session named <agent>-<basename(cwd)> with the chosen
 # agent CLI (codex by default, claude if requested) running inside.
 # Idempotent: if the session exists, attaches instead.
 
@@ -14,12 +14,13 @@ CWD="${1:-$PWD}"
 shift || true
 
 # Second arg (when present) is the resolved tmux session name from daemon.
-# Backward-compat fallback to claude-<basename(cwd)>.
-if [ "$#" -gt 0 ] && [[ "$1" == claude-* ]]; then
+# Accept either prefix (codex- is the codex default, claude- for --agent claude
+# and legacy bindings). Fallback to codex-<basename(cwd)>.
+if [ "$#" -gt 0 ] && { [[ "$1" == codex-* ]] || [[ "$1" == claude-* ]]; }; then
     NAME="$1"
     shift
 else
-    NAME="claude-$(basename "$CWD")"
+    NAME="codex-$(basename "$CWD")"
 fi
 
 # Third arg = agent name ("codex" | "claude"). Default codex.

@@ -404,7 +404,13 @@ class RealLarkCli(LarkCli):
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+        except asyncio.TimeoutError:
+            # Without this the lark-cli child + its pipes leak as a zombie.
+            proc.kill()
+            await proc.wait()
+            raise
         if proc.returncode != 0:
             combined = stdout.decode() + "\n" + stderr.decode()
             raise RuntimeError(f"lark-cli download failed (exit {proc.returncode}): {combined!r}")

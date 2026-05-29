@@ -111,7 +111,10 @@ def build_status_card(
     """Compose a Feishu interactive card summarizing current binding state."""
     jsonl_path = Path(jsonl_path) if jsonl_path else None
     meta = _extract_recent_meta(jsonl_path) if jsonl_path and jsonl_path.exists() else {}
-    agent_kind = meta.get("agent_kind") or extra.get("agent_kind") if extra else None
+    # Parenthesize: without it, `A or B if extra else None` parses as
+    # `(A or B) if extra else None`, so when extra is None we'd discard the
+    # agent_kind already detected from the jsonl meta.
+    agent_kind = meta.get("agent_kind") or (extra.get("agent_kind") if extra else None)
     agent_kind = agent_kind or "agent"
     agent_emoji = "🤖" if agent_kind != "codex" else "🟦"
 

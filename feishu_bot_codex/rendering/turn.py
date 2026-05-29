@@ -318,6 +318,8 @@ def _split_text_by_mermaid(text: str) -> list[tuple[str, str]]:
 # total element count to stay under the per-message budget (~30KB / ~50 elements).
 MARKDOWN_CHAR_LIMIT = 4000
 MAX_ELEMENTS_PER_CARD = 40
+# Leave headroom under Feishu's ~30KB card body cap (error code 230025).
+CARD_BODY_BYTE_BUDGET = 28000
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -326,17 +328,43 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"\n…(截断 {len(text) - limit} 字符)…"
 
 
+def _cap_card_bytes(elements: list[dict]) -> list[dict]:
+    """Trim trailing elements so the serialized body stays under Feishu's
+    ~30KB limit. The per-element char cap can't bound the cumulative body
+    size — 40 elements × 4000 CJK chars (~3 bytes/char) is ~468KB."""
+    total = 0
+    kept: list[dict] = []
+    for el in elements:
+        size = len(json.dumps(el, ensure_ascii=False).encode("utf-8"))
+        if total + size > CARD_BODY_BYTE_BUDGET and kept:
+            dropped = len(elements) - len(kept)
+            kept.append(build_note(f"…内容超长,省略末尾 {dropped} 段…"))
+            break
+        total += size
+        kept.append(el)
+    return kept
+
+
 
 # Regex to spot absolute image paths embedded in plain text.
+# NOTE on the path sub-pattern: segments are separated by an explicit
+# delimiter (`/` for POSIX, `\` for Windows) that is NOT part of the segment
+# character class. The earlier form `/[\w./\-]+` let `.` `/` and `\w` all
+# match the same chars, so a long path-like string lacking a terminal image
+# extension caused catastrophic backtracking (a 60KB pseudo-path froze the
+# render for ~12s). With the delimiter fixed, backtracking is linear per
+# segment instead of exponential across the whole string.
+_PATH_BODY = r"(?:/(?:[\w.\-]+/)*[\w.\-]+|[A-Za-z]:\\(?:[\w.\- ]+\\)*[\w.\- ]+)"
+
 _IMAGE_PATH_RE = re.compile(
-    r"(?:!?\[[^\]]*\]\()?(?P<path>(?:/[\w./\-]+|[A-Za-z]:\\[\w.\\\- ]+)\.(?:png|jpe?g|gif|webp|bmp))\)?",
+    r"(?:!?\[[^\]]*\]\()?(?P<path>" + _PATH_BODY + r"\.(?:png|jpe?g|gif|webp|bmp))\)?",
     re.IGNORECASE,
 )
 
 # Non-image file extensions we'll auto-upload as standalone Feishu messages.
 _FILE_PATH_RE = re.compile(
     r"(?<![\w./])"
-    r"(?P<path>(?:/[\w./\-]+|[A-Za-z]:\\[\w.\\\- ]+)\."
+    r"(?P<path>" + _PATH_BODY + r"\."
     r"(?:pdf|txt|md|markdown|csv|tsv|json|yaml|yml|toml|xml|"
     r"py|js|ts|tsx|jsx|go|rs|java|kt|swift|c|h|cpp|hpp|cs|rb|php|"
     r"sh|bash|zsh|fish|sql|html|css|scss|log|conf|ini|cfg|"
@@ -507,6 +535,10 @@ def render_turn_to_card(
         dropped = len(elements) - (MAX_ELEMENTS_PER_CARD - 1)
         elements = elements[:MAX_ELEMENTS_PER_CARD - 1]
         elements.append(build_note(f"…省略 {dropped} 个工具调用/段落…"))
+
+    # Byte-budget cap (see _cap_card_bytes): element count alone can't keep
+    # the body under Feishu's ~30KB limit when text is long / CJK-heavy.
+    elements = _cap_card_bytes(elements)
 
     if in_progress:
         import time
