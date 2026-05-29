@@ -196,6 +196,8 @@ class Orchestrator:
             # If state already has chat_id (prior bootstrap), skip the
             # "consume first message" behavior on this restart.
             bootstrap_complete=bool(state.chat_id),
+            # Persist the at-least-once dedup ring across restarts.
+            dedup_path=self._data_dir / f"seen-{cfg.name}.json",
         )
 
         # Initial backlog process. If chat_id is already known from a prior

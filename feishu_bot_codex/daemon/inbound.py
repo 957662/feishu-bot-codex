@@ -80,6 +80,7 @@ class InboundPipeline:
         bindings_card_builder=None,
         find_card_builder=None,
         chat_id_provider=None,
+        dedup_path=None,
     ) -> None:
         self._tmux_session = tmux_session
         self._tmux = tmux
@@ -101,6 +102,13 @@ class InboundPipeline:
         # we don't double-forward the same user message to Claude.
         self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_event_ids_max = 1024
+        # Persist the dedup ring so a daemon restart doesn't re-forward events
+        # Feishu re-delivers (at-least-once) after a reconnect — without this
+        # the in-memory set is empty on boot and duplicates get injected into
+        # the TUI.
+        self._dedup_path = Path(dedup_path) if dedup_path else None
+        if self._dedup_path:
+            self._load_seen()
         # Retain fire-and-forget reaction tasks: a bare asyncio.create_task is
         # only weakly referenced by the loop, so it can be GC'd mid-flight and
         # its exceptions are swallowed. Hold a strong ref until done.
@@ -138,6 +146,7 @@ class InboundPipeline:
             self._seen_event_ids[event_id] = None
             if len(self._seen_event_ids) > self._seen_event_ids_max:
                 self._seen_event_ids.popitem(last=False)
+            self._persist_seen()
 
         evt_type = event.get("type", "")
         if evt_type == "im.message.receive_v1":
@@ -472,6 +481,28 @@ class InboundPipeline:
         except Exception as e:
             logger.warning("file download failed (msg=%s key=%s): %s", message_id, file_key, e)
             return None
+
+    def _load_seen(self) -> None:
+        """Restore the recent-event_id ring from disk (best-effort)."""
+        try:
+            if self._dedup_path and self._dedup_path.exists():
+                ids = json.loads(self._dedup_path.read_text(encoding="utf-8"))
+                for eid in ids[-self._seen_event_ids_max:]:
+                    self._seen_event_ids[eid] = None
+        except Exception as e:
+            logger.debug("dedup ring load failed (ignored): %s", e)
+
+    def _persist_seen(self) -> None:
+        """Atomically write the dedup ring to disk (best-effort). Inbound user
+        events are human-paced, so a small JSON write per event is cheap."""
+        if not self._dedup_path:
+            return
+        try:
+            tmp = self._dedup_path.with_suffix(self._dedup_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(list(self._seen_event_ids.keys())), encoding="utf-8")
+            os.replace(tmp, self._dedup_path)
+        except Exception as e:
+            logger.debug("dedup ring persist failed (ignored): %s", e)
 
     def _react_bg(self, message_id: str, emoji_type: str) -> None:
         """Fire-and-forget reaction with the task held until done (see
